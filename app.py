@@ -1,691 +1,651 @@
 #!/usr/bin/env python3
-"""Flask app for UFC fight outcome prediction + bet tracking."""
+"""Flask app for training LSTM-from-sequences from a web UI."""
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 import os
 import subprocess
 import sys
-import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any
 
-os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(max(1, int(os.cpu_count() or 1))))
-warnings.filterwarnings(
-    "ignore",
-    message="Could not find the number of physical cores*",
-    category=UserWarning,
-)
-
-import numpy as np
-import pandas as pd
 from flask import Flask, jsonify, render_template, request
 
-from web_predictor import FightPredictor
-
-
 APP_ROOT = Path(__file__).resolve().parent
-BETS_PATH = APP_ROOT / "data" / "bets_tracker.csv"
-SCRAPER_SCRIPT = APP_ROOT / "scrape_ufc_fights.py"
-SCRAPER_TIMEOUT_SECONDS = int(os.getenv("SCRAPER_TIMEOUT_SECONDS", "7200"))
+TRAIN_SCRIPT = APP_ROOT / "scripts" / "train_lstm_from_sequences.py"
+SCRAPER_SCRIPT = APP_ROOT / "scripts" / "scrape_ufc_fight_details.py"
+SEQUENCE_SCRIPT = APP_ROOT / "scripts" / "build_fight_history_sequences.py"
+AUDIT_SCRIPT = APP_ROOT / "scripts" / "audit_lstm_pipeline_data.py"
+RAW_FIGHTS_CSV = APP_ROOT / "data" / "ufc_fight_details_lstm.csv"
+SEQUENCE_CSV = APP_ROOT / "data" / "ufc_lstm_sequences.csv"
+SCRAPER_CHECKPOINT_DB = APP_ROOT / "data" / "checkpoints" / "ufc_fight_details_checkpoint.sqlite"
 
-BET_COLUMNS = [
-    "bet_id",
-    "created_at_utc",
-    "settled_at_utc",
-    "status",
-    "result",
-    "event_date",
-    "fighter_1",
-    "fighter_2",
-    "pick",
-    "actual_winner",
-    "weight_class",
-    "gender",
-    "scheduled_rounds",
-    "is_title_bout",
-    "model",
-    "model_label",
-    "model_test_accuracy",
-    "p_fighter_1",
-    "p_fighter_2",
-    "model_prob_pick",
-    "odds_american",
-    "implied_prob_at_bet",
-    "model_edge",
-    "stake",
-    "pnl",
-    "return_amount",
-    "potential_profit",
-    "sportsbook",
-    "notes",
-]
-
-predictor = FightPredictor(
-    APP_ROOT / "data" / "ufc_fights_rnn.csv",
-    default_model=os.getenv("UFC_DEFAULT_MODEL", "accuracy_weighted_ensemble"),
-    power_profile=os.getenv("UFC_POWER_PROFILE", "max_power"),
-)
-PREDICTOR_LOCK = RLock()
-app = Flask(__name__)
-
-RECOMMENDED_MIN_EDGE = 0.02
-KELLY_FRACTION = 0.25
-KELLY_CAP = 0.05
+DEFAULT_PARAMS: dict[str, Any] = {
+    "input_csv": "data/ufc_lstm_sequences.csv",
+    "model_path": "champion_lstm_model.pth",
+    "scaler_path": "data/model_cache/lstm_sequence_scalers.pkl",
+    "metrics_path": "data/model_cache/lstm_sequence_metrics.json",
+    "epochs": 120,
+    "patience": 20,
+    "batch_size": 256,
+    "hidden_size": 96,
+    "num_layers": 1,
+    "dropout": 0.35,
+    "lr": 0.0005,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "bidirectional": True,
+    "use_cross_attention": True,
+    "attention_heads": 4,
+    "attention_dropout": 0.10,
+    "static_recency_mode": "ema",
+    "ema_alpha": 0.65,
+    "val_fraction": 0.15,
+    "test_fraction": 0.15,
+    "max_fights": "",
+    "seed": 42,
+    "device": "auto",
+    "num_workers": 0,
+    "log_level": "INFO",
+}
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        out = float(value)
-        if np.isnan(out):
-            return default
-        return out
-    except (TypeError, ValueError):
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
         return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
-def american_to_implied_prob(odds_american: int) -> float:
-    if odds_american == 0:
-        raise ValueError("American odds cannot be 0.")
-    if odds_american > 0:
-        return 100.0 / (odds_american + 100.0)
-    abs_odds = abs(float(odds_american))
-    return abs_odds / (abs_odds + 100.0)
-
-
-def profit_from_american(stake: float, odds_american: int) -> float:
-    if odds_american > 0:
-        return stake * (odds_american / 100.0)
-    return stake * (100.0 / abs(float(odds_american)))
-
-
-def american_to_decimal(odds_american: int) -> float:
-    if odds_american == 0:
-        raise ValueError("American odds cannot be 0.")
-    if odds_american > 0:
-        return 1.0 + (odds_american / 100.0)
-    return 1.0 + (100.0 / abs(float(odds_american)))
-
-
-def parse_optional_american_odds(raw: str | None) -> int | None:
-    text = str(raw or "").strip()
+def parse_optional_int(value: Any) -> int | None:
+    text = str(value or "").strip()
     if not text:
         return None
-    try:
-        odds = int(text)
-    except ValueError as exc:
-        raise ValueError(f"Invalid American odds value: {text!r}") from exc
-    if odds == 0:
-        raise ValueError("American odds cannot be 0.")
-    return odds
+    return int(text)
 
 
-def parse_optional_positive_float(raw: str | None) -> float | None:
-    text = str(raw or "").strip()
-    if not text:
-        return None
-    try:
-        value = float(text)
-    except ValueError as exc:
-        raise ValueError(f"Invalid numeric value: {text!r}") from exc
-    if np.isnan(value) or value <= 0:
-        raise ValueError("Value must be greater than 0.")
-    return value
+def resolve_output_path(raw: str) -> Path:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return candidate
+    return (APP_ROOT / candidate).resolve()
 
 
-def build_bet_recommendation(
-    prediction: dict[str, Any],
-    odds_fighter_1: int | None,
-    odds_fighter_2: int | None,
-    bankroll: float | None,
-) -> dict[str, Any]:
-    base = {
-        "available": False,
-        "should_bet": False,
-        "message": "Enter both fighter American odds to get a recommendation.",
-        "recommended_pick": None,
-        "recommended_odds": None,
-        "recommended_edge": None,
-        "recommended_expected_roi": None,
-        "suggested_stake": None,
-        "bankroll": bankroll,
-        "sides": [],
-    }
-    if odds_fighter_1 is None or odds_fighter_2 is None:
-        return base
+def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = dict(DEFAULT_PARAMS)
+    params.update({k: v for k, v in payload.items() if v is not None})
 
-    side_defs = [
-        (prediction["fighter_1"], float(prediction["p_fighter_1"]), int(odds_fighter_1)),
-        (prediction["fighter_2"], float(prediction["p_fighter_2"]), int(odds_fighter_2)),
-    ]
-    sides = []
-    for fighter, prob, odds in side_defs:
-        implied = float(american_to_implied_prob(odds))
-        decimal_odds = float(american_to_decimal(odds))
-        edge = float(prob - implied)
-        expected_roi = float(prob * decimal_odds - 1.0)
-        b = max(decimal_odds - 1.0, 1e-9)
-        full_kelly = max(float((b * prob - (1.0 - prob)) / b), 0.0)
-        suggested_stake = None
-        if bankroll and bankroll > 0:
-            suggested_fraction = min(full_kelly * KELLY_FRACTION, KELLY_CAP)
-            suggested_stake = float(bankroll * suggested_fraction)
-        sides.append(
-            {
-                "fighter": fighter,
-                "prob": prob,
-                "odds_american": odds,
-                "implied_prob": implied,
-                "edge": edge,
-                "expected_roi": expected_roi,
-                "full_kelly_fraction": full_kelly,
-                "suggested_stake": suggested_stake,
-            }
-        )
-
-    best = sorted(sides, key=lambda r: (r["expected_roi"], r["edge"]), reverse=True)[0]
-    should_bet = best["expected_roi"] > 0 and best["edge"] >= RECOMMENDED_MIN_EDGE
-    if should_bet:
-        message = (
-            f"Recommended: {best['fighter']} at {best['odds_american']:+d} "
-            f"(edge {best['edge'] * 100:.2f}%, expected ROI {best['expected_roi'] * 100:.2f}%)."
-        )
-    else:
-        message = (
-            "No clear value bet at current odds (requires positive EV and "
-            f"at least {RECOMMENDED_MIN_EDGE * 100:.0f}% edge)."
-        )
-
-    return {
-        "available": True,
-        "should_bet": bool(should_bet),
-        "message": message,
-        "recommended_pick": best["fighter"] if should_bet else None,
-        "recommended_odds": int(best["odds_american"]) if should_bet else None,
-        "recommended_edge": float(best["edge"]) if should_bet else None,
-        "recommended_expected_roi": float(best["expected_roi"]) if should_bet else None,
-        "suggested_stake": best["suggested_stake"] if should_bet else None,
-        "bankroll": bankroll,
-        "sides": sides,
+    parsed: dict[str, Any] = {
+        "input_csv": str(params["input_csv"]).strip(),
+        "model_path": str(params["model_path"]).strip(),
+        "scaler_path": str(params["scaler_path"]).strip(),
+        "metrics_path": str(params["metrics_path"]).strip(),
+        "epochs": int(params["epochs"]),
+        "patience": int(params["patience"]),
+        "batch_size": int(params["batch_size"]),
+        "hidden_size": int(params["hidden_size"]),
+        "num_layers": int(params["num_layers"]),
+        "dropout": float(params["dropout"]),
+        "lr": float(params["lr"]),
+        "weight_decay": float(params["weight_decay"]),
+        "grad_clip": float(params["grad_clip"]),
+        "bidirectional": parse_bool(params.get("bidirectional"), default=True),
+        "use_cross_attention": parse_bool(params.get("use_cross_attention"), default=True),
+        "attention_heads": int(params["attention_heads"]),
+        "attention_dropout": float(params["attention_dropout"]),
+        "static_recency_mode": str(params["static_recency_mode"]).strip().lower(),
+        "ema_alpha": float(params["ema_alpha"]),
+        "val_fraction": float(params["val_fraction"]),
+        "test_fraction": float(params["test_fraction"]),
+        "max_fights": parse_optional_int(params.get("max_fights")),
+        "seed": int(params["seed"]),
+        "device": str(params["device"]).strip().lower(),
+        "num_workers": int(params["num_workers"]),
+        "log_level": str(params["log_level"]).strip().upper(),
     }
 
+    if not parsed["input_csv"]:
+        raise ValueError("Input CSV path is required.")
+    if parsed["epochs"] <= 0:
+        raise ValueError("Epochs must be > 0.")
+    if parsed["patience"] <= 0:
+        raise ValueError("Patience must be > 0.")
+    if parsed["batch_size"] <= 0:
+        raise ValueError("Batch size must be > 0.")
+    if parsed["hidden_size"] <= 0:
+        raise ValueError("Hidden size must be > 0.")
+    if parsed["num_layers"] <= 0:
+        raise ValueError("Num layers must be > 0.")
+    if not (0.0 <= parsed["dropout"] < 1.0):
+        raise ValueError("Dropout must be in [0, 1).")
+    if parsed["lr"] <= 0:
+        raise ValueError("Learning rate must be > 0.")
+    if parsed["weight_decay"] < 0:
+        raise ValueError("Weight decay must be >= 0.")
+    if parsed["grad_clip"] <= 0:
+        raise ValueError("Grad clip must be > 0.")
+    if parsed["attention_heads"] <= 0:
+        raise ValueError("Attention heads must be > 0.")
+    if not (0.0 <= parsed["attention_dropout"] < 1.0):
+        raise ValueError("Attention dropout must be in [0, 1).")
+    if parsed["static_recency_mode"] not in {"ema", "mean"}:
+        raise ValueError("Static recency mode must be 'ema' or 'mean'.")
+    if not (0.0 <= parsed["ema_alpha"] <= 1.0):
+        raise ValueError("EMA alpha must be in [0, 1].")
+    if not (0.01 <= parsed["val_fraction"] < 0.49):
+        raise ValueError("Validation fraction must be between 0.01 and 0.49.")
+    if not (0.01 <= parsed["test_fraction"] < 0.49):
+        raise ValueError("Test fraction must be between 0.01 and 0.49.")
+    if parsed["val_fraction"] + parsed["test_fraction"] >= 0.8:
+        raise ValueError("Validation + test fractions are too large.")
+    if parsed["max_fights"] is not None and parsed["max_fights"] <= 0:
+        raise ValueError("Max fights must be empty or > 0.")
+    if parsed["num_workers"] < 0:
+        raise ValueError("Num workers must be >= 0.")
+    if parsed["device"] not in {"auto", "cpu", "cuda", "mps"}:
+        raise ValueError("Device must be one of auto/cpu/cuda/mps.")
+    if parsed["log_level"] not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        raise ValueError("Log level must be DEBUG/INFO/WARNING/ERROR.")
 
-def run_scraper_update() -> str:
-    if not SCRAPER_SCRIPT.exists():
-        raise FileNotFoundError(f"Scraper script not found: {SCRAPER_SCRIPT}")
-    cmd = [
-        sys.executable,
-        str(SCRAPER_SCRIPT),
-        "--output-csv",
-        str(APP_ROOT / "data" / "ufc_fights_rnn.csv"),
-        "--checkpoint-db",
-        str(APP_ROOT / "data" / "checkpoints" / "ufc_fights_checkpoint.sqlite"),
-        "--log-level",
-        "INFO",
-    ]
-    result = subprocess.run(
-        cmd,
-        cwd=str(APP_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=SCRAPER_TIMEOUT_SECONDS,
-    )
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    if result.returncode != 0:
-        tail = "\n".join((stdout + "\n" + stderr).strip().splitlines()[-12:])
-        raise RuntimeError(f"Scraper failed (exit {result.returncode}).\n{tail}")
-    lines = stdout.splitlines()
-    if not lines:
-        return "Scrape completed."
-    return lines[-1]
-
-
-def _ensure_bet_store() -> None:
-    BETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not BETS_PATH.exists():
-        pd.DataFrame(columns=BET_COLUMNS).to_csv(BETS_PATH, index=False)
-
-
-def load_bets() -> pd.DataFrame:
-    _ensure_bet_store()
-    df = pd.read_csv(BETS_PATH)
-    for col in BET_COLUMNS:
-        if col not in df.columns:
-            df[col] = np.nan
-    df = df[BET_COLUMNS].copy()
-
-    numeric_cols = [
-        "bet_id",
-        "model_test_accuracy",
-        "p_fighter_1",
-        "p_fighter_2",
-        "model_prob_pick",
-        "odds_american",
-        "implied_prob_at_bet",
-        "model_edge",
-        "stake",
-        "pnl",
-        "return_amount",
-        "potential_profit",
-        "scheduled_rounds",
-    ]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    text_cols = [c for c in BET_COLUMNS if c not in numeric_cols]
-    for col in text_cols:
-        df[col] = df[col].astype("object")
-    return df
+    return parsed
 
 
-def save_bets(df: pd.DataFrame) -> None:
-    out = df.copy()
-    for col in BET_COLUMNS:
-        if col not in out.columns:
-            out[col] = np.nan
-    out = out[BET_COLUMNS]
-    out.to_csv(BETS_PATH, index=False)
+def build_train_command(params: dict[str, Any]) -> list[str]:
+    cmd = [sys.executable, "-u", str(TRAIN_SCRIPT)]
+    cmd += ["--input-csv", params["input_csv"]]
+    cmd += ["--model-path", params["model_path"]]
+    cmd += ["--scaler-path", params["scaler_path"]]
+    cmd += ["--metrics-path", params["metrics_path"]]
+    cmd += ["--epochs", str(params["epochs"])]
+    cmd += ["--patience", str(params["patience"])]
+    cmd += ["--batch-size", str(params["batch_size"])]
+    cmd += ["--hidden-size", str(params["hidden_size"])]
+    cmd += ["--num-layers", str(params["num_layers"])]
+    cmd += ["--dropout", str(params["dropout"])]
+    cmd += ["--lr", str(params["lr"])]
+    cmd += ["--weight-decay", str(params["weight_decay"])]
+    cmd += ["--grad-clip", str(params["grad_clip"])]
+    cmd += ["--attention-heads", str(params["attention_heads"])]
+    cmd += ["--attention-dropout", str(params["attention_dropout"])]
+    cmd += ["--static-recency-mode", params["static_recency_mode"]]
+    cmd += ["--ema-alpha", str(params["ema_alpha"])]
+    cmd += ["--val-fraction", str(params["val_fraction"])]
+    cmd += ["--test-fraction", str(params["test_fraction"])]
+    if params["max_fights"] is not None:
+        cmd += ["--max-fights", str(params["max_fights"])]
+    cmd += ["--seed", str(params["seed"])]
+    cmd += ["--device", params["device"]]
+    cmd += ["--num-workers", str(params["num_workers"])]
+    cmd += ["--log-level", params["log_level"]]
+
+    cmd.append("--bidirectional" if params["bidirectional"] else "--no-bidirectional")
+    cmd.append("--use-cross-attention" if params["use_cross_attention"] else "--no-cross-attention")
+    return cmd
 
 
-def records_for_template(df: pd.DataFrame) -> list[dict[str, Any]]:
-    if df.empty:
-        return []
-    out = df.copy()
-    out = out.where(pd.notna(out), None)
-    return out.to_dict(orient="records")
-
-
-def next_bet_id(df: pd.DataFrame) -> int:
-    if df.empty or df["bet_id"].dropna().empty:
-        return 1
-    return int(df["bet_id"].max()) + 1
-
-
-def compute_tracker_summary(open_bets: pd.DataFrame, settled_bets: pd.DataFrame) -> dict[str, Any]:
-    settled_stake = float(settled_bets["stake"].fillna(0).sum()) if not settled_bets.empty else 0.0
-    settled_pnl = float(settled_bets["pnl"].fillna(0).sum()) if not settled_bets.empty else 0.0
-    open_stake = float(open_bets["stake"].fillna(0).sum()) if not open_bets.empty else 0.0
-    roi = (settled_pnl / settled_stake) if settled_stake > 0 else 0.0
-
-    wins = int((settled_bets["result"] == "win").sum()) if not settled_bets.empty else 0
-    losses = int((settled_bets["result"] == "loss").sum()) if not settled_bets.empty else 0
-    pushes = int((settled_bets["result"] == "push").sum()) if not settled_bets.empty else 0
-    graded = wins + losses
-    hit_rate = (wins / graded) if graded > 0 else 0.0
-
-    return {
-        "open_bets": int(len(open_bets)),
-        "settled_bets": int(len(settled_bets)),
-        "open_stake": open_stake,
-        "settled_stake": settled_stake,
-        "settled_pnl": settled_pnl,
-        "roi": roi,
-        "wins": wins,
-        "losses": losses,
-        "pushes": pushes,
-        "hit_rate": hit_rate,
-    }
-
-
-def model_performance_table(settled_bets: pd.DataFrame) -> list[dict[str, Any]]:
-    if settled_bets.empty:
-        return []
-
-    rows: list[dict[str, Any]] = []
-    for (model, model_label), g in settled_bets.groupby(["model", "model_label"], dropna=False):
-        g = g.copy()
-        wins = int((g["result"] == "win").sum())
-        losses = int((g["result"] == "loss").sum())
-        pushes = int((g["result"] == "push").sum())
-        stake = float(g["stake"].fillna(0).sum())
-        pnl = float(g["pnl"].fillna(0).sum())
-        roi = (pnl / stake) if stake > 0 else 0.0
-
-        graded = g[g["result"].isin(["win", "loss"])].copy()
-        hit_rate = float((graded["result"] == "win").mean()) if not graded.empty else float("nan")
-
-        probs = np.clip(graded["model_prob_pick"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
-        actual = (graded["result"] == "win").astype(int).to_numpy(dtype=int)
-        if len(actual) > 0:
-            log_loss_val = float(-np.mean(actual * np.log(probs) + (1 - actual) * np.log(1 - probs)))
-            brier = float(np.mean((probs - actual) ** 2))
-        else:
-            log_loss_val = float("nan")
-            brier = float("nan")
-
-        rows.append(
-            {
-                "model": str(model),
-                "model_label": str(model_label),
-                "bets": int(len(g)),
-                "wins": wins,
-                "losses": losses,
-                "pushes": pushes,
-                "hit_rate": hit_rate,
-                "stake": stake,
-                "pnl": pnl,
-                "roi": roi,
-                "avg_edge": float(g["model_edge"].fillna(0).mean()),
-                "avg_confidence": float(np.abs(g["p_fighter_1"] - g["p_fighter_2"]).fillna(0).mean()),
-                "log_loss": log_loss_val,
-                "brier": brier,
-            }
-        )
-    rows.sort(key=lambda r: (r["roi"], r["pnl"]), reverse=True)
-    return rows
-
-
-@app.route("/", methods=["GET", "POST"])
-def index() -> str:
-    prediction: dict[str, Any] | None = None
-    predictions: list[dict[str, Any]] | None = None
+@dataclass
+class TrainingRun:
+    run_id: int
+    started_at_utc: str
+    params: dict[str, Any]
+    command: list[str]
+    metrics_path_abs: Path
+    process: subprocess.Popen[str] | None = None
+    running: bool = True
+    finished_at_utc: str | None = None
+    return_code: int | None = None
+    logs: list[str] = field(default_factory=list)
+    stop_requested: bool = False
+    metrics: dict[str, Any] | None = None
     error: str | None = None
-    notice: str | None = None
-    system_status = predictor.model_cache_status()
 
-    form_values = {
-        "fighter_1": "",
-        "fighter_2": "",
-        "event_date": str(pd.Timestamp.today().date()),
-        "weight_class": predictor.context_defaults["weight_class"],
-        "gender": predictor.context_defaults["gender"],
-        "scheduled_rounds": predictor.context_defaults["scheduled_rounds"],
-        "odds_fighter_1": "",
-        "odds_fighter_2": "",
-        "bankroll": "",
-        "is_title_bout": False,
-        "model": predictor.default_model,
-        "predict_all": False,
-    }
 
-    if request.method == "POST":
-        action = request.form.get("action", "predict").strip().lower()
-        bets_df = load_bets()
+class TrainingManager:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._run_counter = 0
+        self._current: TrainingRun | None = None
+        self._max_log_lines = 8000
 
-        if action == "predict":
-            form_values["fighter_1"] = request.form.get("fighter_1", "").strip()
-            form_values["fighter_2"] = request.form.get("fighter_2", "").strip()
-            form_values["event_date"] = request.form.get("event_date", form_values["event_date"]).strip()
-            form_values["weight_class"] = request.form.get("weight_class", form_values["weight_class"]).strip()
-            form_values["gender"] = request.form.get("gender", form_values["gender"]).strip()
-            form_values["scheduled_rounds"] = request.form.get(
-                "scheduled_rounds", str(form_values["scheduled_rounds"])
-            ).strip()
-            form_values["odds_fighter_1"] = request.form.get("odds_fighter_1", "").strip()
-            form_values["odds_fighter_2"] = request.form.get("odds_fighter_2", "").strip()
-            form_values["bankroll"] = request.form.get("bankroll", "").strip()
-            form_values["is_title_bout"] = request.form.get("is_title_bout") == "on"
-            form_values["model"] = request.form.get("model", predictor.default_model).strip()
-            form_values["predict_all"] = request.form.get("predict_all") == "on"
+    def start(self, params: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._current and self._current.running:
+                raise RuntimeError("A training run is already in progress.")
+            if not TRAIN_SCRIPT.exists():
+                raise FileNotFoundError(f"Training script not found: {TRAIN_SCRIPT}")
 
-            try:
-                rounds = int(form_values["scheduled_rounds"])
-                odds_f1 = parse_optional_american_odds(form_values["odds_fighter_1"])
-                odds_f2 = parse_optional_american_odds(form_values["odds_fighter_2"])
-                bankroll = parse_optional_positive_float(form_values["bankroll"])
-                if form_values["predict_all"]:
-                    with PREDICTOR_LOCK:
-                        predictions = predictor.predict_matchup_all(
-                            fighter_1_name=form_values["fighter_1"],
-                            fighter_2_name=form_values["fighter_2"],
-                            event_date=form_values["event_date"] or None,
-                            weight_class=form_values["weight_class"] or None,
-                            gender=form_values["gender"] or None,
-                            scheduled_rounds=rounds,
-                            is_title_bout=bool(form_values["is_title_bout"]),
-                        )
-                    for pred in predictions:
-                        pred["recommendation"] = build_bet_recommendation(pred, odds_f1, odds_f2, bankroll)
-                else:
-                    with PREDICTOR_LOCK:
-                        prediction = predictor.predict_matchup(
-                            fighter_1_name=form_values["fighter_1"],
-                            fighter_2_name=form_values["fighter_2"],
-                            event_date=form_values["event_date"] or None,
-                            weight_class=form_values["weight_class"] or None,
-                            gender=form_values["gender"] or None,
-                            scheduled_rounds=rounds,
-                            is_title_bout=bool(form_values["is_title_bout"]),
-                            model_name=form_values["model"],
-                        )
-                    prediction["recommendation"] = build_bet_recommendation(
-                        prediction,
-                        odds_f1,
-                        odds_f2,
-                        bankroll,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                error = str(exc)
+            self._run_counter += 1
+            cmd = build_train_command(params)
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(APP_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            run = TrainingRun(
+                run_id=self._run_counter,
+                started_at_utc=utc_now_iso(),
+                params=params,
+                command=cmd,
+                metrics_path_abs=resolve_output_path(params["metrics_path"]),
+                process=proc,
+                running=True,
+            )
+            run.logs.append(f"[{run.started_at_utc}] Started run #{run.run_id}")
+            run.logs.append(f"Command: {' '.join(cmd)}")
+            self._current = run
 
-        elif action == "update_data":
-            try:
-                scraper_summary = run_scraper_update()
-                with PREDICTOR_LOCK:
-                    system_status = predictor.reload_data()
-                notice = (
-                    "Data update complete. Models were not retrained. "
-                    f"{scraper_summary}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                error = str(exc)
+            worker = Thread(target=self._consume_output, args=(run,), daemon=True)
+            worker.start()
+            return self.snapshot()
 
-        elif action == "retrain_models":
-            try:
-                with PREDICTOR_LOCK:
-                    system_status = predictor.retrain_models()
-                notice = (
-                    "Model retrain complete. "
-                    f"Rows used: {system_status.get('data_rows', 'n/a')}."
-                )
-            except Exception as exc:  # noqa: BLE001
-                error = str(exc)
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(self._current and self._current.running)
 
-        elif action == "add_bet":
-            try:
-                fighter_1 = request.form.get("fighter_1", "").strip()
-                fighter_2 = request.form.get("fighter_2", "").strip()
-                event_date = request.form.get("event_date", "").strip() or None
-                weight_class = request.form.get("weight_class", "").strip() or None
-                gender = request.form.get("gender", "").strip() or None
-                scheduled_rounds = int(request.form.get("scheduled_rounds", "3"))
-                is_title_bout = request.form.get("is_title_bout", "false").strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            if not self._current or not self._current.running:
+                raise RuntimeError("No active training run to stop.")
+            run = self._current
+            run.stop_requested = True
+            if run.process and run.process.poll() is None:
+                run.process.terminate()
+                run.logs.append(f"[{utc_now_iso()}] Stop requested. Sent terminate signal.")
+            return self.snapshot()
+
+    def snapshot(self, tail_lines: int = 500) -> dict[str, Any]:
+        with self._lock:
+            if self._current is None:
+                return {
+                    "has_run": False,
+                    "state": "idle",
+                    "running": False,
+                    "log_tail": "",
                 }
-                model_name = request.form.get("model", predictor.default_model).strip().lower()
-                pick = request.form.get("pick", "").strip()
-                odds_american = int(request.form.get("odds_american", "0").strip())
-                stake = float(request.form.get("stake", "0").strip())
-                sportsbook = request.form.get("sportsbook", "").strip()
-                notes = request.form.get("notes", "").strip()
+            run = self._current
+            if run.running:
+                state = "running"
+            elif run.return_code == 0:
+                state = "succeeded"
+            elif run.stop_requested:
+                state = "stopped"
+            else:
+                state = "failed"
 
-                if model_name == "all":
-                    raise ValueError("Choose one model for a logged bet.")
-                if stake <= 0:
-                    raise ValueError("Stake must be greater than 0.")
-                if odds_american == 0:
-                    raise ValueError("American odds cannot be 0.")
+            tail = "\n".join(run.logs[-max(1, tail_lines) :])
+            return {
+                "has_run": True,
+                "state": state,
+                "running": run.running,
+                "run_id": run.run_id,
+                "started_at_utc": run.started_at_utc,
+                "finished_at_utc": run.finished_at_utc,
+                "return_code": run.return_code,
+                "stop_requested": run.stop_requested,
+                "error": run.error,
+                "params": run.params,
+                "command": run.command,
+                "metrics_path": str(run.metrics_path_abs),
+                "metrics": run.metrics,
+                "log_tail": tail,
+            }
 
-                with PREDICTOR_LOCK:
-                    pred = predictor.predict_matchup(
-                        fighter_1_name=fighter_1,
-                        fighter_2_name=fighter_2,
-                        event_date=event_date,
-                        weight_class=weight_class,
-                        gender=gender,
-                        scheduled_rounds=scheduled_rounds,
-                        is_title_bout=is_title_bout,
-                        model_name=model_name,
-                    )
-                if pick not in {pred["fighter_1"], pred["fighter_2"]}:
-                    raise ValueError("Pick must match one of the two fighters.")
+    def _append_log(self, run: TrainingRun, line: str) -> None:
+        run.logs.append(line.rstrip("\n"))
+        if len(run.logs) > self._max_log_lines:
+            del run.logs[:1200]
 
-                p_pick = float(pred["p_fighter_1"] if pick == pred["fighter_1"] else pred["p_fighter_2"])
-                implied = float(american_to_implied_prob(odds_american))
-                edge = float(p_pick - implied)
-                potential_profit = float(profit_from_american(stake, odds_american))
+    def _consume_output(self, run: TrainingRun) -> None:
+        return_code = -1
+        try:
+            proc = run.process
+            if proc is None:
+                raise RuntimeError("Missing process handle for run.")
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    with self._lock:
+                        if self._current is run:
+                            self._append_log(run, line)
+            return_code = proc.wait()
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                run.error = str(exc)
+                self._append_log(run, f"[{utc_now_iso()}] Internal monitor error: {exc}")
+            return_code = -1
+        finally:
+            with self._lock:
+                run.running = False
+                run.return_code = return_code
+                run.finished_at_utc = utc_now_iso()
+                run.process = None
+                self._append_log(run, f"[{run.finished_at_utc}] Run completed with exit code {return_code}.")
+                if run.metrics_path_abs.exists():
+                    try:
+                        with run.metrics_path_abs.open("r", encoding="utf-8") as f:
+                            run.metrics = json.load(f)
+                    except Exception as exc:  # noqa: BLE001
+                        run.error = str(exc)
+                        self._append_log(run, f"[{utc_now_iso()}] Could not parse metrics file: {exc}")
 
-                new_row = {
-                    "bet_id": next_bet_id(bets_df),
-                    "created_at_utc": pd.Timestamp.utcnow().isoformat(),
-                    "settled_at_utc": "",
-                    "status": "open",
-                    "result": "",
-                    "event_date": pred["event_date"],
-                    "fighter_1": pred["fighter_1"],
-                    "fighter_2": pred["fighter_2"],
-                    "pick": pick,
-                    "actual_winner": "",
-                    "weight_class": pred["weight_class"],
-                    "gender": pred["gender"],
-                    "scheduled_rounds": pred["scheduled_rounds"],
-                    "is_title_bout": bool(pred["is_title_bout"]),
-                    "model": pred["model"],
-                    "model_label": pred["model_label"],
-                    "model_test_accuracy": pred["model_test_accuracy"],
-                    "p_fighter_1": pred["p_fighter_1"],
-                    "p_fighter_2": pred["p_fighter_2"],
-                    "model_prob_pick": p_pick,
-                    "odds_american": odds_american,
-                    "implied_prob_at_bet": implied,
-                    "model_edge": edge,
-                    "stake": stake,
-                    "pnl": np.nan,
-                    "return_amount": np.nan,
-                    "potential_profit": potential_profit,
-                    "sportsbook": sportsbook,
-                    "notes": notes,
-                }
-                bets_df = pd.concat([bets_df, pd.DataFrame([new_row])], ignore_index=True)
-                save_bets(bets_df)
-                notice = (
-                    f"Bet logged: {pick} at {odds_american:+d}, "
-                    f"stake ${stake:.2f}, model edge {edge * 100:.2f}%."
-                )
-            except Exception as exc:  # noqa: BLE001
-                error = str(exc)
 
-        elif action == "settle_bet":
+@dataclass(frozen=True)
+class PipelineAction:
+    key: str
+    label: str
+    command: list[str]
+    description: str
+
+
+PIPELINE_ACTIONS: dict[str, PipelineAction] = {
+    "update_data": PipelineAction(
+        key="update_data",
+        label="Update Data",
+        command=[sys.executable, "-u", str(SCRAPER_SCRIPT)],
+        description="Continue scraper from checkpoint and append/update latest fight data.",
+    ),
+    "reset_data": PipelineAction(
+        key="reset_data",
+        label="Reset Data + Rescrape",
+        command=[
+            sys.executable,
+            "-u",
+            str(SCRAPER_SCRIPT),
+            "--refresh-processed-events",
+            "--refresh-existing-fights",
+        ],
+        description="Delete fight data/checkpoint and scrape a fresh full dataset.",
+    ),
+    "build_sequences": PipelineAction(
+        key="build_sequences",
+        label="Build Sequences",
+        command=[sys.executable, "-u", str(SEQUENCE_SCRIPT)],
+        description="Rebuild fighter-history sequence CSV from raw fight details.",
+    ),
+    "audit_data": PipelineAction(
+        key="audit_data",
+        label="Audit Data",
+        command=[sys.executable, "-u", str(AUDIT_SCRIPT)],
+        description="Run data integrity audit across raw and sequence datasets.",
+    ),
+}
+
+
+@dataclass
+class PipelineRun:
+    run_id: int
+    action_key: str
+    action_label: str
+    started_at_utc: str
+    command: list[str]
+    process: subprocess.Popen[str] | None = None
+    running: bool = True
+    finished_at_utc: str | None = None
+    return_code: int | None = None
+    logs: list[str] = field(default_factory=list)
+    stop_requested: bool = False
+    error: str | None = None
+
+
+class PipelineManager:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._run_counter = 0
+        self._current: PipelineRun | None = None
+        self._max_log_lines = 8000
+
+    def _cleanup_for_reset(self, run: PipelineRun) -> None:
+        targets = [
+            RAW_FIGHTS_CSV,
+            SEQUENCE_CSV,
+            SCRAPER_CHECKPOINT_DB,
+            SCRAPER_CHECKPOINT_DB.with_name(SCRAPER_CHECKPOINT_DB.name + "-wal"),
+            SCRAPER_CHECKPOINT_DB.with_name(SCRAPER_CHECKPOINT_DB.name + "-shm"),
+        ]
+        run.logs.append(f"[{utc_now_iso()}] Reset requested. Deleting existing data artifacts...")
+        for path in targets:
             try:
-                bet_id = int(request.form.get("bet_id", "0").strip())
-                actual_winner = request.form.get("actual_winner", "").strip()
-                mask = bets_df["bet_id"] == bet_id
-                if not mask.any():
-                    raise ValueError(f"Bet id {bet_id} not found.")
-                idx = bets_df.index[mask][0]
-                if str(bets_df.at[idx, "status"]) == "settled":
-                    raise ValueError(f"Bet id {bet_id} is already settled.")
-
-                pick = str(bets_df.at[idx, "pick"])
-                fighter_1 = str(bets_df.at[idx, "fighter_1"])
-                fighter_2 = str(bets_df.at[idx, "fighter_2"])
-                stake = _safe_float(bets_df.at[idx, "stake"], 0.0)
-                odds = int(_safe_float(bets_df.at[idx, "odds_american"], 0.0))
-
-                if actual_winner.lower() == "push":
-                    result = "push"
-                    pnl = 0.0
-                    ret = stake
-                elif actual_winner in {fighter_1, fighter_2}:
-                    if pick == actual_winner:
-                        result = "win"
-                        pnl = float(profit_from_american(stake, odds))
-                        ret = stake + pnl
-                    else:
-                        result = "loss"
-                        pnl = -stake
-                        ret = 0.0
-                else:
-                    raise ValueError("Settle winner must be Fighter 1, Fighter 2, or Push.")
-
-                bets_df.at[idx, "status"] = "settled"
-                bets_df.at[idx, "result"] = result
-                bets_df.at[idx, "actual_winner"] = actual_winner
-                bets_df.at[idx, "settled_at_utc"] = pd.Timestamp.utcnow().isoformat()
-                bets_df.at[idx, "pnl"] = pnl
-                bets_df.at[idx, "return_amount"] = ret
-                save_bets(bets_df)
-                notice = f"Bet {bet_id} settled as {result.upper()} (PnL: ${pnl:.2f})."
+                path.unlink()
+                run.logs.append(f"Deleted: {path.relative_to(APP_ROOT)}")
+            except FileNotFoundError:
+                run.logs.append(f"Skip (not found): {path.relative_to(APP_ROOT)}")
             except Exception as exc:  # noqa: BLE001
-                error = str(exc)
+                run.logs.append(f"Warning: could not delete {path.relative_to(APP_ROOT)}: {exc}")
 
-    bets_df = load_bets()
-    open_bets = bets_df[bets_df["status"] == "open"].copy()
-    settled_bets = bets_df[bets_df["status"] == "settled"].copy()
+    def start(self, action_key: str) -> dict[str, Any]:
+        action = PIPELINE_ACTIONS.get(action_key)
+        if action is None:
+            raise ValueError(
+                f"Unknown action '{action_key}'. Valid actions: {', '.join(sorted(PIPELINE_ACTIONS))}"
+            )
+        with self._lock:
+            if self._current and self._current.running:
+                raise RuntimeError("A data pipeline job is already in progress.")
 
-    open_bets = open_bets.sort_values(["created_at_utc", "bet_id"], ascending=[False, False])
-    settled_bets = settled_bets.sort_values(["settled_at_utc", "bet_id"], ascending=[False, False])
+            script_path = Path(action.command[2]) if len(action.command) >= 3 else None
+            if script_path is not None and not script_path.exists():
+                raise FileNotFoundError(f"Pipeline script not found: {script_path}")
 
-    summary = compute_tracker_summary(open_bets, settled_bets)
-    model_perf = model_performance_table(settled_bets)
-    with PREDICTOR_LOCK:
-        system_status = predictor.model_cache_status()
+            self._run_counter += 1
+            run = PipelineRun(
+                run_id=self._run_counter,
+                action_key=action.key,
+                action_label=action.label,
+                started_at_utc=utc_now_iso(),
+                command=action.command,
+                running=True,
+            )
+            run.logs.append(f"[{run.started_at_utc}] Started job #{run.run_id}: {run.action_label}")
+            run.logs.append(f"Description: {action.description}")
+            if action.key == "reset_data":
+                self._cleanup_for_reset(run)
 
+            proc = subprocess.Popen(
+                action.command,
+                cwd=str(APP_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            run.process = proc
+            run.logs.append(f"Command: {' '.join(action.command)}")
+            self._current = run
+
+            worker = Thread(target=self._consume_output, args=(run,), daemon=True)
+            worker.start()
+            return self.snapshot()
+
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            if not self._current or not self._current.running:
+                raise RuntimeError("No active data pipeline job to stop.")
+            run = self._current
+            run.stop_requested = True
+            if run.process and run.process.poll() is None:
+                run.process.terminate()
+                run.logs.append(f"[{utc_now_iso()}] Stop requested. Sent terminate signal.")
+            return self.snapshot()
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(self._current and self._current.running)
+
+    def snapshot(self, tail_lines: int = 500) -> dict[str, Any]:
+        with self._lock:
+            if self._current is None:
+                return {
+                    "has_run": False,
+                    "state": "idle",
+                    "running": False,
+                    "log_tail": "",
+                }
+            run = self._current
+            if run.running:
+                state = "running"
+            elif run.return_code == 0:
+                state = "succeeded"
+            elif run.stop_requested:
+                state = "stopped"
+            else:
+                state = "failed"
+
+            tail = "\n".join(run.logs[-max(1, tail_lines) :])
+            return {
+                "has_run": True,
+                "state": state,
+                "running": run.running,
+                "run_id": run.run_id,
+                "action_key": run.action_key,
+                "action_label": run.action_label,
+                "started_at_utc": run.started_at_utc,
+                "finished_at_utc": run.finished_at_utc,
+                "return_code": run.return_code,
+                "stop_requested": run.stop_requested,
+                "error": run.error,
+                "command": run.command,
+                "log_tail": tail,
+            }
+
+    def _append_log(self, run: PipelineRun, line: str) -> None:
+        run.logs.append(line.rstrip("\n"))
+        if len(run.logs) > self._max_log_lines:
+            del run.logs[:1200]
+
+    def _consume_output(self, run: PipelineRun) -> None:
+        return_code = -1
+        try:
+            proc = run.process
+            if proc is None:
+                raise RuntimeError("Missing process handle for pipeline job.")
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    with self._lock:
+                        if self._current is run:
+                            self._append_log(run, line)
+            return_code = proc.wait()
+        except Exception as exc:  # noqa: BLE001
+            with self._lock:
+                run.error = str(exc)
+                self._append_log(run, f"[{utc_now_iso()}] Internal monitor error: {exc}")
+            return_code = -1
+        finally:
+            with self._lock:
+                run.running = False
+                run.return_code = return_code
+                run.finished_at_utc = utc_now_iso()
+                run.process = None
+                self._append_log(
+                    run,
+                    f"[{run.finished_at_utc}] Job completed with exit code {return_code}.",
+                )
+
+
+app = Flask(__name__)
+trainer = TrainingManager()
+pipeline = PipelineManager()
+
+
+@app.route("/", methods=["GET"])
+def index() -> str:
     return render_template(
         "index.html",
-        fighter_names=predictor.fighter_names,
-        weight_classes=predictor.weight_classes,
-        genders=predictor.genders,
-        model_options=predictor.model_options,
-        form_values=form_values,
-        prediction=prediction,
-        predictions=predictions,
-        notice=notice,
-        error=error,
-        system_status=system_status,
-        summary=summary,
-        model_perf=model_perf,
-        open_bets=records_for_template(open_bets),
-        settled_bets=records_for_template(settled_bets.head(120)),
+        defaults=DEFAULT_PARAMS,
+        script_path=str(TRAIN_SCRIPT.relative_to(APP_ROOT)),
+        status=trainer.snapshot(tail_lines=600),
+        pipeline_status=pipeline.snapshot(tail_lines=600),
     )
 
 
-@app.route("/api/predict", methods=["POST"])
-def predict_api() -> Any:
-    payload = request.get_json(silent=True) or {}
+@app.route("/api/train/start", methods=["POST"])
+def start_training() -> Any:
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = request.form.to_dict()
     try:
-        model_name = str(payload.get("model", predictor.default_model)).strip().lower()
-        predict_all_raw = payload.get("predict_all", False)
-        predict_all = bool(predict_all_raw)
-        if isinstance(predict_all_raw, str):
-            predict_all = predict_all_raw.strip().lower() in {"1", "true", "yes", "on"}
-        if model_name == "all":
-            predict_all = True
-        odds_f1 = parse_optional_american_odds(str(payload.get("odds_fighter_1", "")).strip())
-        odds_f2 = parse_optional_american_odds(str(payload.get("odds_fighter_2", "")).strip())
-        bankroll = parse_optional_positive_float(str(payload.get("bankroll", "")).strip())
-
-        common_kwargs = {
-            "fighter_1_name": str(payload.get("fighter_1", "")),
-            "fighter_2_name": str(payload.get("fighter_2", "")),
-            "event_date": str(payload.get("event_date", "")).strip() or None,
-            "weight_class": str(payload.get("weight_class", "")).strip() or None,
-            "gender": str(payload.get("gender", "")).strip() or None,
-            "scheduled_rounds": int(payload.get("scheduled_rounds", predictor.context_defaults["scheduled_rounds"])),
-            "is_title_bout": bool(payload.get("is_title_bout", False)),
-        }
-
-        if predict_all:
-            with PREDICTOR_LOCK:
-                predictions = predictor.predict_matchup_all(**common_kwargs)
-            for pred in predictions:
-                pred["recommendation"] = build_bet_recommendation(pred, odds_f1, odds_f2, bankroll)
-            return jsonify({"ok": True, "predictions": predictions})
-
-        with PREDICTOR_LOCK:
-            prediction = predictor.predict_matchup(model_name=model_name, **common_kwargs)
-        prediction["recommendation"] = build_bet_recommendation(prediction, odds_f1, odds_f2, bankroll)
-        return jsonify({"ok": True, "prediction": prediction})
+        if pipeline.is_running():
+            raise RuntimeError("Cannot start training while a data pipeline job is running.")
+        params = parse_train_params(payload or {})
+        status = trainer.start(params)
+        return jsonify({"ok": True, "status": status})
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": str(exc)}), 400
+        code = 409 if isinstance(exc, RuntimeError) else 400
+        return jsonify({"ok": False, "error": str(exc)}), code
+
+
+@app.route("/api/train/stop", methods=["POST"])
+def stop_training() -> Any:
+    try:
+        status = trainer.stop()
+        return jsonify({"ok": True, "status": status})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 409
+
+
+@app.route("/api/train/status", methods=["GET"])
+def training_status() -> Any:
+    try:
+        tail_lines = int(request.args.get("tail", "500"))
+    except ValueError:
+        tail_lines = 500
+    tail_lines = min(max(tail_lines, 50), 3000)
+    return jsonify({"ok": True, "status": trainer.snapshot(tail_lines=tail_lines)})
+
+
+@app.route("/api/pipeline/start", methods=["POST"])
+def start_pipeline() -> Any:
+    payload = request.get_json(silent=True)
+    if payload is None:
+        payload = request.form.to_dict()
+    action = str((payload or {}).get("action", "")).strip().lower()
+    try:
+        if trainer.is_running():
+            raise RuntimeError("Cannot run data pipeline while training is active.")
+        status = pipeline.start(action)
+        return jsonify({"ok": True, "status": status})
+    except Exception as exc:  # noqa: BLE001
+        code = 409 if isinstance(exc, RuntimeError) else 400
+        return jsonify({"ok": False, "error": str(exc)}), code
+
+
+@app.route("/api/pipeline/stop", methods=["POST"])
+def stop_pipeline() -> Any:
+    try:
+        status = pipeline.stop()
+        return jsonify({"ok": True, "status": status})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 409
+
+
+@app.route("/api/pipeline/status", methods=["GET"])
+def pipeline_status() -> Any:
+    try:
+        tail_lines = int(request.args.get("tail", "500"))
+    except ValueError:
+        tail_lines = 500
+    tail_lines = min(max(tail_lines, 50), 3000)
+    return jsonify({"ok": True, "status": pipeline.snapshot(tail_lines=tail_lines)})
 
 
 @app.route("/healthz", methods=["GET"])
 def healthz() -> Any:
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "service": "ufc-lstm-pipeline-ui"})
 
 
 if __name__ == "__main__":

@@ -1211,6 +1211,9 @@ def infer_fighter_statuses(status_cell: Optional[Any], method_text: str) -> tupl
 
 
 def extract_fight_totals_stats_from_soup(soup: BeautifulSoup) -> dict[str, Optional[int]]:
+    best_stats: dict[str, Optional[int]] = {}
+    best_score = -1.0
+
     for table in soup.select("table.b-fight-details__table"):
         headers = [normalize_header(cell.get_text(" ", strip=True)) for cell in table.select("thead th")]
         if not headers:
@@ -1249,7 +1252,7 @@ def extract_fight_totals_stats_from_soup(soup: BeautifulSoup) -> dict[str, Optio
             sig_str_2_landed, sig_str_2_attempted = parse_landed_attempted_or_landed(sig_str_2_raw)
             td_1_landed, td_1_attempted = parse_landed_attempted_or_landed(td_1_raw)
             td_2_landed, td_2_attempted = parse_landed_attempted_or_landed(td_2_raw)
-            return {
+            candidate = {
                 "kd_1": parse_int_from_text(kd_1_raw),
                 "kd_2": parse_int_from_text(kd_2_raw),
                 "sig_str_1_landed": sig_str_1_landed,
@@ -1265,7 +1268,28 @@ def extract_fight_totals_stats_from_soup(soup: BeautifulSoup) -> dict[str, Optio
                 "ctrl_seconds_1": parse_control_to_seconds(ctrl_1_raw),
                 "ctrl_seconds_2": parse_control_to_seconds(ctrl_2_raw),
             }
-    return {}
+            # Some pages include per-round and totals rows in the same table.
+            # Prefer the row that looks like full-fight totals (largest aggregate volume).
+            score_components = [
+                candidate.get("sig_str_1_attempted"),
+                candidate.get("sig_str_2_attempted"),
+                candidate.get("td_1_attempted"),
+                candidate.get("td_2_attempted"),
+                candidate.get("ctrl_seconds_1"),
+                candidate.get("ctrl_seconds_2"),
+                candidate.get("sub_1"),
+                candidate.get("sub_2"),
+                candidate.get("kd_1"),
+                candidate.get("kd_2"),
+            ]
+            score = float(sum(value for value in score_components if value is not None))
+            row_text = clean_text(row.get_text(" ", strip=True)).lower()
+            if "total" in row_text:
+                score += 1_000_000.0
+            if score > best_score:
+                best_score = score
+                best_stats = candidate
+    return best_stats
 
 
 def parse_event_fights(client: HttpClient, event: EventMeta) -> list[FightStub]:

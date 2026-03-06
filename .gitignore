@@ -32,7 +32,14 @@ outputs/
 data/checkpoints/
 data/model_cache/
 data/bets_tracker.csv
+data/ufc_fights_cleaned.csv
+data/ufc_lstm_sequences.csv
 .env
 *.sqlite
 *.sqlite3
 *.log
+
+# Local model artifacts
+champion_*.pth
+*.pt
+*.joblib

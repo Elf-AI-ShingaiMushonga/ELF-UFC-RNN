@@ -22,7 +22,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
-from scripts.run_ufc_siamese_study import (
+from scripts.siamese_study_pipeline import (
     NEGATIVE_LABEL,
     POSITIVE_LABEL,
     SPLIT_COL,
