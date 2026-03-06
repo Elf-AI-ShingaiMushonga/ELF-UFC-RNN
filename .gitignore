@@ -30,6 +30,9 @@ htmlcov/
 # Runtime outputs and local checkpoints
 outputs/
 data/checkpoints/
+data/model_cache/
+data/bets_tracker.csv
+.env
 *.sqlite
 *.sqlite3
 *.log

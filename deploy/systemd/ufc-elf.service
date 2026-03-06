@@ -1,0 +1,21 @@
+[Unit]
+Description=UFC Elf Flask Predictor
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=www-data
+WorkingDirectory=/opt/ufc-elf
+EnvironmentFile=-/opt/ufc-elf/.env
+Environment=PATH=/opt/ufc-elf/.venv/bin
+Environment=UFC_POWER_PROFILE=max_power
+Environment=UFC_DEFAULT_MODEL=accuracy_weighted_ensemble
+Environment=LOKY_MAX_CPU_COUNT=8
+ExecStart=/opt/ufc-elf/.venv/bin/gunicorn --config /opt/ufc-elf/gunicorn.conf.py wsgi:app
+Restart=always
+RestartSec=5
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

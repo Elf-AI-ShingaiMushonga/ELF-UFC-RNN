@@ -1,0 +1,10 @@
+bind = "127.0.0.1:8000"
+workers = 1
+threads = 2
+timeout = 7200
+graceful_timeout = 300
+keepalive = 5
+preload_app = True
+accesslog = "-"
+errorlog = "-"
+loglevel = "info"

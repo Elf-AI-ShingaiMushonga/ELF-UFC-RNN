@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UFC Outcome Predictor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="kicker">Fight Intelligence + Bet Ledger</p>
+        <h1>UFC Matchup Predictor</h1>
+        <p class="subhead">
+          Predict outcomes with top models, log bets, settle results, and track model ROI/hit-rate in one place.
+        </p>
+      </section>
+
+      {% if notice %}
+      <section class="panel notice">{{ notice }}</section>
+      {% endif %}
+
+      {% if error %}
+      <section class="panel error">{{ error }}</section>
+      {% endif %}
+
+      <section class="panel ops-panel">
+        <h2>Data & Model Ops</h2>
+        <p class="subhead">
+          Models are cached on disk and reused on restart/deploy. Use these actions only when you want fresh data or a fresh retrain.
+        </p>
+        <p class="subhead">Update/retrain can take several minutes and will block predictions while running.</p>
+        <div class="ops-status">
+          <p>Data rows: <strong>{{ system_status.data_rows }}</strong></p>
+          <p>Data updated (UTC): <strong>{{ system_status.data_updated_utc or "n/a" }}</strong></p>
+          <p>Base models trained (UTC): <strong>{{ system_status.base_models_trained_at_utc or "n/a" }}</strong></p>
+          <p>Loaded base models from cache this boot: <strong>{{ "Yes" if system_status.base_models_loaded_from_cache else "No" }}</strong></p>
+        </div>
+        <div class="ops-buttons">
+          <form method="post">
+            <input type="hidden" name="action" value="update_data" />
+            <button type="submit" class="secondary">Update Data (Run Scraper)</button>
+          </form>
+          <form method="post">
+            <input type="hidden" name="action" value="retrain_models" />
+            <button type="submit">Retrain Models</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel">
+        <form method="post" class="predict-form">
+          <input type="hidden" name="action" value="predict" />
+          <div class="grid two">
+            <label>
+              Fighter 1
+              <input name="fighter_1" list="fighters" value="{{ form_values.fighter_1 }}" required />
+            </label>
+            <label>
+              Fighter 2
+              <input name="fighter_2" list="fighters" value="{{ form_values.fighter_2 }}" required />
+            </label>
+          </div>
+
+          <datalist id="fighters">
+            {% for name in fighter_names %}
+            <option value="{{ name }}"></option>
+            {% endfor %}
+          </datalist>
+
+          <div class="grid four">
+            <label>
+              Event Date
+              <input type="date" name="event_date" value="{{ form_values.event_date }}" />
+            </label>
+
+            <label>
+              Weight Class
+              <select name="weight_class">
+                <option value="">Default</option>
+                {% for wc in weight_classes %}
+                <option value="{{ wc }}" {% if form_values.weight_class == wc %}selected{% endif %}>{{ wc }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Gender
+              <select name="gender">
+                <option value="">Default</option>
+                {% for g in genders %}
+                <option value="{{ g }}" {% if form_values.gender == g %}selected{% endif %}>{{ g }}</option>
+                {% endfor %}
+              </select>
+            </label>
+
+            <label>
+              Scheduled Rounds
+              <input type="number" min="1" max="7" name="scheduled_rounds" value="{{ form_values.scheduled_rounds }}" />
+            </label>
+          </div>
+
+          <div class="grid three odds-grid">
+            <label>
+              Fighter 1 Odds (American)
+              <input type="number" name="odds_fighter_1" placeholder="-140 or 125" value="{{ form_values.odds_fighter_1 }}" />
+            </label>
+            <label>
+              Fighter 2 Odds (American)
+              <input type="number" name="odds_fighter_2" placeholder="-140 or 125" value="{{ form_values.odds_fighter_2 }}" />
+            </label>
+            <label>
+              Bankroll ($, optional)
+              <input type="number" step="0.01" min="0.01" name="bankroll" placeholder="1000" value="{{ form_values.bankroll }}" />
+            </label>
+          </div>
+
+          <div class="grid two model-pick">
+            <label>
+              Prediction Model
+              <select name="model">
+                {% for option in model_options %}
+                <option value="{{ option.key }}" {% if form_values.model == option.key %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+          </div>
+
+          <label class="inline-toggle">
+            <input type="checkbox" name="is_title_bout" {% if form_values.is_title_bout %}checked{% endif %} />
+            <span>Title Bout</span>
+          </label>
+
+          <label class="inline-toggle">
+            <input type="checkbox" name="predict_all" {% if form_values.predict_all %}checked{% endif %} />
+            <span>All models (incl. Siamese)</span>
+          </label>
+
+          <button type="submit">Predict Fight Outcome</button>
+        </form>
+      </section>
+
+      {% if prediction %}
+      <section class="panel result">
+        <header>
+          <h2>{{ prediction.fighter_1 }} vs {{ prediction.fighter_2 }}</h2>
+          <p>
+            {{ prediction.weight_class }} | {{ prediction.gender }} | {{ prediction.scheduled_rounds }} rounds
+            {% if prediction.is_title_bout %} | Title Bout{% endif %}
+          </p>
+        </header>
+
+        <div class="winner">
+          Predicted Winner: <strong>{{ prediction.winner }}</strong>
+        </div>
+
+        <div class="prob-grid">
+          <div>
+            <p>{{ prediction.fighter_1 }}</p>
+            <div class="meter">
+              <span style="width: {{ (prediction.p_fighter_1 * 100)|round(2) }}%"></span>
+            </div>
+            <strong>{{ (prediction.p_fighter_1 * 100)|round(2) }}%</strong>
+          </div>
+          <div>
+            <p>{{ prediction.fighter_2 }}</p>
+            <div class="meter">
+              <span style="width: {{ (prediction.p_fighter_2 * 100)|round(2) }}%"></span>
+            </div>
+            <strong>{{ (prediction.p_fighter_2 * 100)|round(2) }}%</strong>
+          </div>
+        </div>
+
+        <p class="confidence">Confidence gap: {{ (prediction.confidence * 100)|round(2) }} percentage points</p>
+        <p class="confidence">Model: {{ prediction.model_label }} (historical test acc: {{ (prediction.model_test_accuracy * 100)|round(2) }}%)</p>
+
+        {% if prediction.recommendation %}
+        <div class="recommendation {% if prediction.recommendation.should_bet %}recommended{% endif %}">
+          <h3>Odds-Based Recommendation</h3>
+          <p class="model-meta">{{ prediction.recommendation.message }}</p>
+          {% if prediction.recommendation.available %}
+          <div class="rec-grid">
+            {% for side in prediction.recommendation.sides %}
+            <div class="rec-card">
+              <p><strong>{{ side.fighter }}</strong> @ {{ "%+d"|format(side.odds_american|int) }}</p>
+              <p>Model prob: {{ "%.2f"|format(side.prob * 100) }}%</p>
+              <p>Implied prob: {{ "%.2f"|format(side.implied_prob * 100) }}%</p>
+              <p>Edge: {{ "%.2f"|format(side.edge * 100) }}%</p>
+              <p>Expected ROI: {{ "%.2f"|format(side.expected_roi * 100) }}%</p>
+            </div>
+            {% endfor %}
+          </div>
+          {% if prediction.recommendation.should_bet and prediction.recommendation.suggested_stake is not none %}
+          <p class="confidence">Suggested stake ({{ "%.2f"|format((prediction.recommendation.bankroll or 0)) }} bankroll): ${{ "%.2f"|format(prediction.recommendation.suggested_stake) }}</p>
+          {% endif %}
+          {% endif %}
+        </div>
+        {% endif %}
+
+        <form method="post" class="bet-form">
+          <input type="hidden" name="action" value="add_bet" />
+          <input type="hidden" name="fighter_1" value="{{ prediction.fighter_1 }}" />
+          <input type="hidden" name="fighter_2" value="{{ prediction.fighter_2 }}" />
+          <input type="hidden" name="event_date" value="{{ prediction.event_date }}" />
+          <input type="hidden" name="weight_class" value="{{ prediction.weight_class }}" />
+          <input type="hidden" name="gender" value="{{ prediction.gender }}" />
+          <input type="hidden" name="scheduled_rounds" value="{{ prediction.scheduled_rounds }}" />
+          <input type="hidden" name="is_title_bout" value="{{ prediction.is_title_bout }}" />
+          <input type="hidden" name="model" value="{{ prediction.model }}" />
+          {% set default_pick = prediction.winner %}
+          {% set default_odds = '' %}
+          {% set default_stake = 100 %}
+          {% if prediction.recommendation and prediction.recommendation.should_bet %}
+          {% set default_pick = prediction.recommendation.recommended_pick %}
+          {% set default_odds = prediction.recommendation.recommended_odds %}
+          {% if prediction.recommendation.suggested_stake is not none %}
+          {% set default_stake = prediction.recommendation.suggested_stake %}
+          {% endif %}
+          {% endif %}
+          <h3>Log Bet</h3>
+          <div class="grid four">
+            <label>
+              Pick
+              <select name="pick">
+                <option value="{{ prediction.fighter_1 }}" {% if default_pick == prediction.fighter_1 %}selected{% endif %}>{{ prediction.fighter_1 }}</option>
+                <option value="{{ prediction.fighter_2 }}" {% if default_pick == prediction.fighter_2 %}selected{% endif %}>{{ prediction.fighter_2 }}</option>
+              </select>
+            </label>
+            <label>
+              American Odds
+              <input type="number" name="odds_american" placeholder="-140 or 125" value="{{ default_odds }}" required />
+            </label>
+            <label>
+              Stake ($)
+              <input type="number" step="0.01" min="0.01" name="stake" value="{{ '%.2f'|format(default_stake) }}" required />
+            </label>
+            <label>
+              Sportsbook
+              <input name="sportsbook" placeholder="DraftKings / FanDuel" />
+            </label>
+          </div>
+          <label>
+            Notes
+            <input name="notes" placeholder="Reason for bet, line movement, etc." />
+          </label>
+          <button type="submit">Add Bet To Tracker</button>
+        </form>
+      </section>
+      {% endif %}
+
+      {% if predictions %}
+      <section class="panel result">
+        <header>
+          <h2>{{ predictions[0].fighter_1 }} vs {{ predictions[0].fighter_2 }}</h2>
+          <p>
+            {{ predictions[0].weight_class }} | {{ predictions[0].gender }} | {{ predictions[0].scheduled_rounds }} rounds
+            {% if predictions[0].is_title_bout %} | Title Bout{% endif %}
+          </p>
+        </header>
+
+        <div class="results-grid">
+          {% for pred in predictions %}
+          <article class="result-card">
+            <h3>{{ pred.model_label }}</h3>
+            <p class="model-meta">Historical test acc: {{ (pred.model_test_accuracy * 100)|round(2) }}%</p>
+            <div class="winner">
+              Predicted Winner: <strong>{{ pred.winner }}</strong>
+            </div>
+            <div class="prob-grid">
+              <div>
+                <p>{{ pred.fighter_1 }}</p>
+                <div class="meter">
+                  <span style="width: {{ (pred.p_fighter_1 * 100)|round(2) }}%"></span>
+                </div>
+                <strong>{{ (pred.p_fighter_1 * 100)|round(2) }}%</strong>
+              </div>
+              <div>
+                <p>{{ pred.fighter_2 }}</p>
+                <div class="meter">
+                  <span style="width: {{ (pred.p_fighter_2 * 100)|round(2) }}%"></span>
+                </div>
+                <strong>{{ (pred.p_fighter_2 * 100)|round(2) }}%</strong>
+              </div>
+            </div>
+            <p class="confidence">Confidence gap: {{ (pred.confidence * 100)|round(2) }} percentage points</p>
+            {% if pred.recommendation %}
+            <div class="recommendation compact {% if pred.recommendation.should_bet %}recommended{% endif %}">
+              <p class="model-meta">{{ pred.recommendation.message }}</p>
+              {% if pred.recommendation.available %}
+              <div class="rec-grid">
+                {% for side in pred.recommendation.sides %}
+                <div class="rec-card">
+                  <p><strong>{{ side.fighter }}</strong> @ {{ "%+d"|format(side.odds_american|int) }}</p>
+                  <p>Edge: {{ "%.2f"|format(side.edge * 100) }}%</p>
+                  <p>EV: {{ "%.2f"|format(side.expected_roi * 100) }}%</p>
+                </div>
+                {% endfor %}
+              </div>
+              {% endif %}
+            </div>
+            {% endif %}
+
+            <form method="post" class="bet-form compact">
+              <input type="hidden" name="action" value="add_bet" />
+              <input type="hidden" name="fighter_1" value="{{ pred.fighter_1 }}" />
+              <input type="hidden" name="fighter_2" value="{{ pred.fighter_2 }}" />
+              <input type="hidden" name="event_date" value="{{ pred.event_date }}" />
+              <input type="hidden" name="weight_class" value="{{ pred.weight_class }}" />
+              <input type="hidden" name="gender" value="{{ pred.gender }}" />
+              <input type="hidden" name="scheduled_rounds" value="{{ pred.scheduled_rounds }}" />
+              <input type="hidden" name="is_title_bout" value="{{ pred.is_title_bout }}" />
+              <input type="hidden" name="model" value="{{ pred.model }}" />
+              {% set default_pick = pred.winner %}
+              {% set default_odds = '' %}
+              {% set default_stake = 100 %}
+              {% if pred.recommendation and pred.recommendation.should_bet %}
+              {% set default_pick = pred.recommendation.recommended_pick %}
+              {% set default_odds = pred.recommendation.recommended_odds %}
+              {% if pred.recommendation.suggested_stake is not none %}
+              {% set default_stake = pred.recommendation.suggested_stake %}
+              {% endif %}
+              {% endif %}
+              <div class="grid two">
+                <label>
+                  Pick
+                  <select name="pick">
+                    <option value="{{ pred.fighter_1 }}" {% if default_pick == pred.fighter_1 %}selected{% endif %}>{{ pred.fighter_1 }}</option>
+                    <option value="{{ pred.fighter_2 }}" {% if default_pick == pred.fighter_2 %}selected{% endif %}>{{ pred.fighter_2 }}</option>
+                  </select>
+                </label>
+                <label>
+                  Odds
+                  <input type="number" name="odds_american" placeholder="-140 or 125" value="{{ default_odds }}" required />
+                </label>
+              </div>
+              <div class="grid two">
+                <label>
+                  Stake
+                  <input type="number" step="0.01" min="0.01" name="stake" value="{{ '%.2f'|format(default_stake) }}" required />
+                </label>
+                <label>
+                  Sportsbook
+                  <input name="sportsbook" />
+                </label>
+              </div>
+              <label>
+                Notes
+                <input name="notes" />
+              </label>
+              <button type="submit">Log Bet</button>
+            </form>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+      <section class="panel">
+        <h2>Bet Tracker Summary</h2>
+        <div class="stats-grid">
+          <article class="stat-card">
+            <p class="stat-label">Open Bets</p>
+            <p class="stat-value">{{ summary.open_bets }}</p>
+            <p class="stat-sub">Open stake: ${{ "%.2f"|format(summary.open_stake) }}</p>
+          </article>
+          <article class="stat-card">
+            <p class="stat-label">Settled Bets</p>
+            <p class="stat-value">{{ summary.settled_bets }}</p>
+            <p class="stat-sub">Stake: ${{ "%.2f"|format(summary.settled_stake) }}</p>
+          </article>
+          <article class="stat-card">
+            <p class="stat-label">PnL</p>
+            <p class="stat-value {% if summary.settled_pnl >= 0 %}pos{% else %}neg{% endif %}">
+              ${{ "%.2f"|format(summary.settled_pnl) }}
+            </p>
+            <p class="stat-sub">ROI: {{ "%.2f"|format(summary.roi * 100) }}%</p>
+          </article>
+          <article class="stat-card">
+            <p class="stat-label">Win / Loss / Push</p>
+            <p class="stat-value">{{ summary.wins }} / {{ summary.losses }} / {{ summary.pushes }}</p>
+            <p class="stat-sub">Hit rate (graded): {{ "%.2f"|format(summary.hit_rate * 100) }}%</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Open Bets</h2>
+        {% if open_bets %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Fight</th>
+                <th>Pick</th>
+                <th>Model</th>
+                <th>Prob</th>
+                <th>Odds</th>
+                <th>Edge</th>
+                <th>Stake</th>
+                <th>Potential</th>
+                <th>Settle</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for b in open_bets %}
+              <tr>
+                <td>{{ b.bet_id|int }}</td>
+                <td>{{ b.fighter_1 }} vs {{ b.fighter_2 }}</td>
+                <td>{{ b.pick }}</td>
+                <td>{{ b.model_label }}</td>
+                <td>{{ "%.2f"|format((b.model_prob_pick or 0) * 100) }}%</td>
+                <td>{{ "%+d"|format((b.odds_american or 0)|int) }}</td>
+                <td>{{ "%.2f"|format((b.model_edge or 0) * 100) }}%</td>
+                <td>${{ "%.2f"|format(b.stake or 0) }}</td>
+                <td>${{ "%.2f"|format(b.potential_profit or 0) }}</td>
+                <td>
+                  <form method="post" class="settle-form">
+                    <input type="hidden" name="action" value="settle_bet" />
+                    <input type="hidden" name="bet_id" value="{{ b.bet_id|int }}" />
+                    <select name="actual_winner" required>
+                      <option value="">Winner...</option>
+                      <option value="{{ b.fighter_1 }}">{{ b.fighter_1 }}</option>
+                      <option value="{{ b.fighter_2 }}">{{ b.fighter_2 }}</option>
+                      <option value="push">Push</option>
+                    </select>
+                    <button type="submit">Settle</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="empty">No open bets yet.</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <h2>Model Betting Performance</h2>
+        {% if model_perf %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Bets</th>
+                <th>W/L/P</th>
+                <th>Hit Rate</th>
+                <th>Stake</th>
+                <th>PnL</th>
+                <th>ROI</th>
+                <th>Avg Edge</th>
+                <th>Log Loss</th>
+                <th>Brier</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for m in model_perf %}
+              <tr>
+                <td>{{ m.model_label }}</td>
+                <td>{{ m.bets }}</td>
+                <td>{{ m.wins }}/{{ m.losses }}/{{ m.pushes }}</td>
+                <td>{% if m.hit_rate == m.hit_rate %}{{ "%.2f"|format(m.hit_rate * 100) }}%{% else %}-{% endif %}</td>
+                <td>${{ "%.2f"|format(m.stake) }}</td>
+                <td class="{% if m.pnl >= 0 %}pos{% else %}neg{% endif %}">${{ "%.2f"|format(m.pnl) }}</td>
+                <td class="{% if m.roi >= 0 %}pos{% else %}neg{% endif %}">{{ "%.2f"|format(m.roi * 100) }}%</td>
+                <td>{{ "%.2f"|format(m.avg_edge * 100) }}%</td>
+                <td>{% if m.log_loss == m.log_loss %}{{ "%.4f"|format(m.log_loss) }}{% else %}-{% endif %}</td>
+                <td>{% if m.brier == m.brier %}{{ "%.4f"|format(m.brier) }}{% else %}-{% endif %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="empty">No settled bets yet, so model betting performance is unavailable.</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <h2>Settled Bets</h2>
+        {% if settled_bets %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Fight</th>
+                <th>Pick</th>
+                <th>Result</th>
+                <th>Model</th>
+                <th>Odds</th>
+                <th>Stake</th>
+                <th>PnL</th>
+                <th>Settled At</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for b in settled_bets %}
+              <tr>
+                <td>{{ b.bet_id|int }}</td>
+                <td>{{ b.fighter_1 }} vs {{ b.fighter_2 }}</td>
+                <td>{{ b.pick }}</td>
+                <td>{{ b.result|upper }}</td>
+                <td>{{ b.model_label }}</td>
+                <td>{{ "%+d"|format((b.odds_american or 0)|int) }}</td>
+                <td>${{ "%.2f"|format(b.stake or 0) }}</td>
+                <td class="{% if (b.pnl or 0) >= 0 %}pos{% else %}neg{% endif %}">${{ "%.2f"|format(b.pnl or 0) }}</td>
+                <td>{{ b.settled_at_utc or "-" }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <p class="empty">No settled bets yet.</p>
+        {% endif %}
+      </section>
+    </main>
+  </body>
+</html>
