@@ -19,6 +19,9 @@ This folder contains data pipelines and training entrypoints. Use this guide to 
 - `train_lstm_from_sequences.py`  
   Trains a Siamese LSTM from `data/ufc_lstm_sequences.csv`.
 
+- `train_lstm_xgboost_ensemble.py`  
+  Trains a momentum-only Siamese LSTM, then trains XGBoost on static pre-fight features + momentum score.
+
 ## Classical / Earlier Training Scripts
 
 - `build_prefight_tabular_dataset.py`: prepares `data/ufc_fights_cleaned.csv` from `data/ufc_fights_rnn.csv`.
@@ -39,4 +42,6 @@ python scripts/scrape_ufc_fight_details.py --refresh-processed-events --refresh-
 python scripts/build_fight_history_sequences.py
 python scripts/audit_lstm_pipeline_data.py
 python scripts/train_lstm_from_sequences.py
+# Optional: sequence + static ensemble
+python scripts/train_lstm_xgboost_ensemble.py
 ```

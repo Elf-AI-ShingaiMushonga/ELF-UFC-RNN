@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flask app for training LSTM-from-sequences from a web UI."""
+"""Flask app for training the LSTM+XGBoost ensemble from a web UI."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 from flask import Flask, jsonify, render_template, request
 
 APP_ROOT = Path(__file__).resolve().parent
-TRAIN_SCRIPT = APP_ROOT / "scripts" / "train_lstm_from_sequences.py"
+TRAIN_SCRIPT = APP_ROOT / "scripts" / "train_lstm_xgboost_ensemble.py"
 SCRAPER_SCRIPT = APP_ROOT / "scripts" / "scrape_ufc_fight_details.py"
 SEQUENCE_SCRIPT = APP_ROOT / "scripts" / "build_fight_history_sequences.py"
 AUDIT_SCRIPT = APP_ROOT / "scripts" / "audit_lstm_pipeline_data.py"
@@ -26,16 +26,20 @@ SCRAPER_CHECKPOINT_DB = APP_ROOT / "data" / "checkpoints" / "ufc_fight_details_c
 
 DEFAULT_PARAMS: dict[str, Any] = {
     "input_csv": "data/ufc_lstm_sequences.csv",
-    "model_path": "champion_lstm_model.pth",
-    "scaler_path": "data/model_cache/lstm_sequence_scalers.pkl",
-    "metrics_path": "data/model_cache/lstm_sequence_metrics.json",
-    "epochs": 120,
-    "patience": 20,
+    "momentum_model_path": "data/model_cache/lstm_momentum_model_site_default.pth",
+    "momentum_scaler_path": "data/model_cache/lstm_momentum_scalers_site_default.pkl",
+    "xgb_model_path": "data/model_cache/lstm_xgb_ensemble_site_default.json",
+    "metrics_path": "data/model_cache/lstm_xgb_ensemble_metrics_site_default.json",
+    "epochs": 100,
+    "patience": 18,
     "batch_size": 256,
     "hidden_size": 96,
-    "num_layers": 1,
+    "num_layers": 2,
     "dropout": 0.35,
     "lr": 0.0005,
+    "warmup_epochs": 5,
+    "min_epochs": 16,
+    "min_delta": 0.00008,
     "weight_decay": 0.0001,
     "grad_clip": 1.0,
     "bidirectional": True,
@@ -43,13 +47,27 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "attention_heads": 4,
     "attention_dropout": 0.10,
     "static_recency_mode": "ema",
-    "ema_alpha": 0.65,
+    "ema_alpha": 0.80,
     "val_fraction": 0.15,
     "test_fraction": 0.15,
     "max_fights": "",
     "seed": 42,
     "device": "auto",
     "num_workers": 0,
+    "xgb_n_estimators": 4000,
+    "xgb_lr": 0.015,
+    "xgb_max_depth": 5,
+    "xgb_min_child_weight": 10.0,
+    "xgb_subsample": 0.90,
+    "xgb_colsample_bytree": 0.85,
+    "xgb_reg_alpha": 0.30,
+    "xgb_reg_lambda": 4.0,
+    "xgb_gamma": 0.20,
+    "xgb_early_stopping": 180,
+    "xgb_n_jobs": 0,
+    "use_oof_stacking": True,
+    "oof_folds": 4,
+    "oof_min_train_fights": 700,
     "log_level": "INFO",
 }
 
@@ -91,8 +109,9 @@ def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
 
     parsed: dict[str, Any] = {
         "input_csv": str(params["input_csv"]).strip(),
-        "model_path": str(params["model_path"]).strip(),
-        "scaler_path": str(params["scaler_path"]).strip(),
+        "momentum_model_path": str(params["momentum_model_path"]).strip(),
+        "momentum_scaler_path": str(params["momentum_scaler_path"]).strip(),
+        "xgb_model_path": str(params["xgb_model_path"]).strip(),
         "metrics_path": str(params["metrics_path"]).strip(),
         "epochs": int(params["epochs"]),
         "patience": int(params["patience"]),
@@ -101,6 +120,9 @@ def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
         "num_layers": int(params["num_layers"]),
         "dropout": float(params["dropout"]),
         "lr": float(params["lr"]),
+        "warmup_epochs": int(params["warmup_epochs"]),
+        "min_epochs": int(params["min_epochs"]),
+        "min_delta": float(params["min_delta"]),
         "weight_decay": float(params["weight_decay"]),
         "grad_clip": float(params["grad_clip"]),
         "bidirectional": parse_bool(params.get("bidirectional"), default=True),
@@ -115,11 +137,33 @@ def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
         "seed": int(params["seed"]),
         "device": str(params["device"]).strip().lower(),
         "num_workers": int(params["num_workers"]),
+        "xgb_n_estimators": int(params["xgb_n_estimators"]),
+        "xgb_lr": float(params["xgb_lr"]),
+        "xgb_max_depth": int(params["xgb_max_depth"]),
+        "xgb_min_child_weight": float(params["xgb_min_child_weight"]),
+        "xgb_subsample": float(params["xgb_subsample"]),
+        "xgb_colsample_bytree": float(params["xgb_colsample_bytree"]),
+        "xgb_reg_alpha": float(params["xgb_reg_alpha"]),
+        "xgb_reg_lambda": float(params["xgb_reg_lambda"]),
+        "xgb_gamma": float(params["xgb_gamma"]),
+        "xgb_early_stopping": int(params["xgb_early_stopping"]),
+        "xgb_n_jobs": int(params["xgb_n_jobs"]),
+        "use_oof_stacking": parse_bool(params.get("use_oof_stacking"), default=True),
+        "oof_folds": int(params["oof_folds"]),
+        "oof_min_train_fights": int(params["oof_min_train_fights"]),
         "log_level": str(params["log_level"]).strip().upper(),
     }
 
     if not parsed["input_csv"]:
         raise ValueError("Input CSV path is required.")
+    if not parsed["momentum_model_path"]:
+        raise ValueError("Momentum model path is required.")
+    if not parsed["momentum_scaler_path"]:
+        raise ValueError("Momentum scaler path is required.")
+    if not parsed["xgb_model_path"]:
+        raise ValueError("XGBoost model path is required.")
+    if not parsed["metrics_path"]:
+        raise ValueError("Metrics path is required.")
     if parsed["epochs"] <= 0:
         raise ValueError("Epochs must be > 0.")
     if parsed["patience"] <= 0:
@@ -134,6 +178,14 @@ def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Dropout must be in [0, 1).")
     if parsed["lr"] <= 0:
         raise ValueError("Learning rate must be > 0.")
+    if parsed["warmup_epochs"] < 0:
+        raise ValueError("Warmup epochs must be >= 0.")
+    if parsed["min_epochs"] <= 0:
+        raise ValueError("Min epochs must be > 0.")
+    if parsed["min_delta"] < 0:
+        raise ValueError("Min delta must be >= 0.")
+    if parsed["min_epochs"] > parsed["epochs"]:
+        raise ValueError("Min epochs must be <= epochs.")
     if parsed["weight_decay"] < 0:
         raise ValueError("Weight decay must be >= 0.")
     if parsed["grad_clip"] <= 0:
@@ -156,6 +208,30 @@ def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Max fights must be empty or > 0.")
     if parsed["num_workers"] < 0:
         raise ValueError("Num workers must be >= 0.")
+    if parsed["xgb_n_estimators"] <= 0:
+        raise ValueError("XGB n_estimators must be > 0.")
+    if parsed["xgb_lr"] <= 0:
+        raise ValueError("XGB learning rate must be > 0.")
+    if parsed["xgb_max_depth"] <= 0:
+        raise ValueError("XGB max_depth must be > 0.")
+    if parsed["xgb_min_child_weight"] <= 0:
+        raise ValueError("XGB min_child_weight must be > 0.")
+    if not (0.0 < parsed["xgb_subsample"] <= 1.0):
+        raise ValueError("XGB subsample must be in (0, 1].")
+    if not (0.0 < parsed["xgb_colsample_bytree"] <= 1.0):
+        raise ValueError("XGB colsample_bytree must be in (0, 1].")
+    if parsed["xgb_reg_alpha"] < 0:
+        raise ValueError("XGB reg_alpha must be >= 0.")
+    if parsed["xgb_reg_lambda"] < 0:
+        raise ValueError("XGB reg_lambda must be >= 0.")
+    if parsed["xgb_gamma"] < 0:
+        raise ValueError("XGB gamma must be >= 0.")
+    if parsed["xgb_early_stopping"] <= 0:
+        raise ValueError("XGB early stopping rounds must be > 0.")
+    if parsed["oof_folds"] <= 0:
+        raise ValueError("OOF folds must be > 0.")
+    if parsed["oof_min_train_fights"] <= 0:
+        raise ValueError("OOF min train fights must be > 0.")
     if parsed["device"] not in {"auto", "cpu", "cuda", "mps"}:
         raise ValueError("Device must be one of auto/cpu/cuda/mps.")
     if parsed["log_level"] not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
@@ -167,8 +243,9 @@ def parse_train_params(payload: dict[str, Any]) -> dict[str, Any]:
 def build_train_command(params: dict[str, Any]) -> list[str]:
     cmd = [sys.executable, "-u", str(TRAIN_SCRIPT)]
     cmd += ["--input-csv", params["input_csv"]]
-    cmd += ["--model-path", params["model_path"]]
-    cmd += ["--scaler-path", params["scaler_path"]]
+    cmd += ["--momentum-model-path", params["momentum_model_path"]]
+    cmd += ["--momentum-scaler-path", params["momentum_scaler_path"]]
+    cmd += ["--xgb-model-path", params["xgb_model_path"]]
     cmd += ["--metrics-path", params["metrics_path"]]
     cmd += ["--epochs", str(params["epochs"])]
     cmd += ["--patience", str(params["patience"])]
@@ -177,6 +254,9 @@ def build_train_command(params: dict[str, Any]) -> list[str]:
     cmd += ["--num-layers", str(params["num_layers"])]
     cmd += ["--dropout", str(params["dropout"])]
     cmd += ["--lr", str(params["lr"])]
+    cmd += ["--warmup-epochs", str(params["warmup_epochs"])]
+    cmd += ["--min-epochs", str(params["min_epochs"])]
+    cmd += ["--min-delta", str(params["min_delta"])]
     cmd += ["--weight-decay", str(params["weight_decay"])]
     cmd += ["--grad-clip", str(params["grad_clip"])]
     cmd += ["--attention-heads", str(params["attention_heads"])]
@@ -190,10 +270,24 @@ def build_train_command(params: dict[str, Any]) -> list[str]:
     cmd += ["--seed", str(params["seed"])]
     cmd += ["--device", params["device"]]
     cmd += ["--num-workers", str(params["num_workers"])]
+    cmd += ["--xgb-n-estimators", str(params["xgb_n_estimators"])]
+    cmd += ["--xgb-lr", str(params["xgb_lr"])]
+    cmd += ["--xgb-max-depth", str(params["xgb_max_depth"])]
+    cmd += ["--xgb-min-child-weight", str(params["xgb_min_child_weight"])]
+    cmd += ["--xgb-subsample", str(params["xgb_subsample"])]
+    cmd += ["--xgb-colsample-bytree", str(params["xgb_colsample_bytree"])]
+    cmd += ["--xgb-reg-alpha", str(params["xgb_reg_alpha"])]
+    cmd += ["--xgb-reg-lambda", str(params["xgb_reg_lambda"])]
+    cmd += ["--xgb-gamma", str(params["xgb_gamma"])]
+    cmd += ["--xgb-early-stopping", str(params["xgb_early_stopping"])]
+    cmd += ["--xgb-n-jobs", str(params["xgb_n_jobs"])]
+    cmd += ["--oof-folds", str(params["oof_folds"])]
+    cmd += ["--oof-min-train-fights", str(params["oof_min_train_fights"])]
     cmd += ["--log-level", params["log_level"]]
 
     cmd.append("--bidirectional" if params["bidirectional"] else "--no-bidirectional")
     cmd.append("--use-cross-attention" if params["use_cross_attention"] else "--no-cross-attention")
+    cmd.append("--use-oof-stacking" if params["use_oof_stacking"] else "--no-oof-stacking")
     return cmd
 
 

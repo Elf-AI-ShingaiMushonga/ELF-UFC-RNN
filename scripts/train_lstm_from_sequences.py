@@ -26,6 +26,30 @@ from torch.utils.data import DataLoader, Dataset
 
 POSITIVE_LABEL = "fighter_1_win"
 NEGATIVE_LABEL = "fighter_2_win"
+OPTIONAL_PREFIGHT_STATIC_COLS = [
+    "f1_pre_fight_elo",
+    "f2_pre_fight_elo",
+    "elo_diff_f1_minus_f2",
+    "f1_days_since_last_fight",
+    "f2_days_since_last_fight",
+    "days_since_last_fight_diff_f1_minus_f2",
+    "fighter_1_age_days",
+    "fighter_2_age_days",
+    "age_days_diff_f1_minus_f2",
+    "age_diff_years_f1_minus_f2",
+    "age_gap_over_5y",
+    "fighter_1_height_cm",
+    "fighter_2_height_cm",
+    "height_cm_diff_f1_minus_f2",
+    "fighter_1_reach_cm",
+    "fighter_2_reach_cm",
+    "reach_cm_diff_f1_minus_f2",
+    "f1_career_significant_strikes_absorbed",
+    "f2_career_significant_strikes_absorbed",
+    "career_significant_strikes_absorbed_diff_f1_minus_f2",
+    "f1_career_significant_strikes_absorbed_over_1500",
+    "f2_career_significant_strikes_absorbed_over_1500",
+]
 
 
 @dataclass
@@ -84,10 +108,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=120, help="Maximum training epochs.")
     parser.add_argument("--patience", type=int, default=20, help="Early-stop patience.")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size.")
-    parser.add_argument("--hidden-size", type=int, default=96, help="LSTM hidden size.")
-    parser.add_argument("--num-layers", type=int, default=1, help="LSTM layers.")
-    parser.add_argument("--dropout", type=float, default=0.35, help="Dropout rate.")
+    parser.add_argument("--hidden-size", type=int, default=48, help="LSTM hidden size.")
+    parser.add_argument("--num-layers", type=int, default=3, help="LSTM layers.")
+    parser.add_argument("--dropout", type=float, default=0.65, help="Dropout rate.")
     parser.add_argument("--lr", type=float, default=5e-4, help="AdamW learning rate.")
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=4,
+        help="Linear LR warmup epochs before plateau scheduling.",
+    )
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=8,
+        help="Minimum epochs to train before early stopping can trigger.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum improvement in score to reset early-stop patience.",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm.")
     parser.add_argument(
@@ -138,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ema-alpha",
         type=float,
-        default=0.65,
+        default=0.75,
         help="EMA alpha for static recency features (used when mode=ema).",
     )
     parser.add_argument(
@@ -268,6 +310,9 @@ def load_dataframe(
     numeric_cols = f1_cols + f2_cols
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    for col in OPTIONAL_PREFIGHT_STATIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
     df = df.dropna(subset=["event_date"]).copy()
@@ -430,6 +475,7 @@ def build_static_features(
     *,
     recency_mode: str,
     ema_alpha: float,
+    prefight_context: Optional[dict[str, float]] = None,
 ) -> np.ndarray:
     # Engineered feature positions after base 12 log stats.
     sig_acc_idx = 12
@@ -452,7 +498,7 @@ def build_static_features(
     ctrl_a = summarize_recent(seq_a, len_a, ctrl_idx, recency_mode, ema_alpha)
     ctrl_b = summarize_recent(seq_b, len_b, ctrl_idx, recency_mode, ema_alpha)
 
-    return np.array(
+    base_static = np.array(
         [
             len_a_norm,
             len_b_norm,
@@ -475,6 +521,93 @@ def build_static_features(
         ],
         dtype=np.float32,
     )
+
+    if prefight_context is None:
+        return base_static
+
+    elo_a = float(prefight_context.get("elo_a", 0.0))
+    elo_b = float(prefight_context.get("elo_b", 0.0))
+    elo_diff = elo_a - elo_b
+
+    days_a = max(float(prefight_context.get("days_a", 0.0)), 0.0)
+    days_b = max(float(prefight_context.get("days_b", 0.0)), 0.0)
+    days_diff = days_a - days_b
+
+    age_a_days = max(float(prefight_context.get("age_a_days", 0.0)), 0.0)
+    age_b_days = max(float(prefight_context.get("age_b_days", 0.0)), 0.0)
+    age_a_years = age_a_days / 365.25 if age_a_days > 0 else 0.0
+    age_b_years = age_b_days / 365.25 if age_b_days > 0 else 0.0
+    age_diff_years = float(prefight_context.get("age_diff_years", age_a_years - age_b_years))
+    if abs(age_diff_years) < 1e-9 and (age_a_years > 0 or age_b_years > 0):
+        age_diff_years = age_a_years - age_b_years
+    abs_age_gap_years = abs(age_diff_years)
+    age_gap_over_5y = float(
+        prefight_context.get(
+            "age_gap_over_5y",
+            1.0 if abs_age_gap_years >= 5.0 else 0.0,
+        )
+    )
+    younger_a = 1.0 if age_diff_years < 0 else 0.0
+    younger_a_when_gap_over_5y = younger_a * age_gap_over_5y
+    height_a_cm = max(float(prefight_context.get("height_a_cm", 0.0)), 0.0)
+    height_b_cm = max(float(prefight_context.get("height_b_cm", 0.0)), 0.0)
+    height_diff_cm = height_a_cm - height_b_cm
+    reach_a_cm = max(float(prefight_context.get("reach_a_cm", 0.0)), 0.0)
+    reach_b_cm = max(float(prefight_context.get("reach_b_cm", 0.0)), 0.0)
+    reach_diff_cm = reach_a_cm - reach_b_cm
+
+    career_abs_a = max(float(prefight_context.get("career_sig_absorbed_a", 0.0)), 0.0)
+    career_abs_b = max(float(prefight_context.get("career_sig_absorbed_b", 0.0)), 0.0)
+    career_abs_diff = career_abs_a - career_abs_b
+    career_abs_log_a = np.log1p(career_abs_a)
+    career_abs_log_b = np.log1p(career_abs_b)
+    career_abs_over_1500_a = float(
+        prefight_context.get(
+            "career_sig_absorbed_over_1500_a",
+            1.0 if career_abs_a >= 1500.0 else 0.0,
+        )
+    )
+    career_abs_over_1500_b = float(
+        prefight_context.get(
+            "career_sig_absorbed_over_1500_b",
+            1.0 if career_abs_b >= 1500.0 else 0.0,
+        )
+    )
+
+    extra_static = np.array(
+        [
+            elo_a,
+            elo_b,
+            elo_diff,
+            days_a,
+            days_b,
+            days_diff,
+            np.log1p(days_a),
+            np.log1p(days_b),
+            age_a_years,
+            age_b_years,
+            age_diff_years,
+            abs_age_gap_years,
+            age_gap_over_5y,
+            younger_a,
+            younger_a_when_gap_over_5y,
+            height_a_cm,
+            height_b_cm,
+            height_diff_cm,
+            reach_a_cm,
+            reach_b_cm,
+            reach_diff_cm,
+            career_abs_a,
+            career_abs_b,
+            career_abs_diff,
+            career_abs_log_a,
+            career_abs_log_b,
+            career_abs_over_1500_a,
+            career_abs_over_1500_b,
+        ],
+        dtype=np.float32,
+    )
+    return np.concatenate([base_static, extra_static], axis=0).astype(np.float32)
 
 
 def chronological_split(
@@ -522,9 +655,83 @@ def build_augmented_samples(
 
     samples: list[SequenceSample] = []
     for i in range(len(df)):
-        fight_id = str(df.iloc[i]["fight_id"])
-        event_date = pd.Timestamp(df.iloc[i]["event_date"])
+        row = df.iloc[i]
+        fight_id = str(row["fight_id"])
+        event_date = pd.Timestamp(row["event_date"])
         target = int(labels[i])
+
+        def row_float(name: str) -> float:
+            if name not in row.index:
+                return 0.0
+            value = row[name]
+            if pd.isna(value):
+                return 0.0
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        elo_f1 = row_float("f1_pre_fight_elo")
+        elo_f2 = row_float("f2_pre_fight_elo")
+        days_f1 = row_float("f1_days_since_last_fight")
+        days_f2 = row_float("f2_days_since_last_fight")
+        age_days_f1 = row_float("fighter_1_age_days")
+        age_days_f2 = row_float("fighter_2_age_days")
+        age_diff_years = row_float("age_diff_years_f1_minus_f2")
+        if abs(age_diff_years) < 1e-9 and (age_days_f1 > 0 or age_days_f2 > 0):
+            age_diff_years = (age_days_f1 - age_days_f2) / 365.25
+        age_gap_over_5y = row_float("age_gap_over_5y")
+        if abs(age_gap_over_5y) < 1e-9 and abs(age_diff_years) >= 5.0:
+            age_gap_over_5y = 1.0
+        height_f1 = row_float("fighter_1_height_cm")
+        height_f2 = row_float("fighter_2_height_cm")
+        reach_f1 = row_float("fighter_1_reach_cm")
+        reach_f2 = row_float("fighter_2_reach_cm")
+        career_abs_f1 = row_float("f1_career_significant_strikes_absorbed")
+        career_abs_f2 = row_float("f2_career_significant_strikes_absorbed")
+        career_abs_over_1500_f1 = row_float("f1_career_significant_strikes_absorbed_over_1500")
+        career_abs_over_1500_f2 = row_float("f2_career_significant_strikes_absorbed_over_1500")
+        if abs(career_abs_over_1500_f1) < 1e-9 and career_abs_f1 >= 1500.0:
+            career_abs_over_1500_f1 = 1.0
+        if abs(career_abs_over_1500_f2) < 1e-9 and career_abs_f2 >= 1500.0:
+            career_abs_over_1500_f2 = 1.0
+
+        prefight_ab = {
+            "elo_a": elo_f1,
+            "elo_b": elo_f2,
+            "days_a": days_f1,
+            "days_b": days_f2,
+            "age_a_days": age_days_f1,
+            "age_b_days": age_days_f2,
+            "age_diff_years": age_diff_years,
+            "age_gap_over_5y": age_gap_over_5y,
+            "height_a_cm": height_f1,
+            "height_b_cm": height_f2,
+            "reach_a_cm": reach_f1,
+            "reach_b_cm": reach_f2,
+            "career_sig_absorbed_a": career_abs_f1,
+            "career_sig_absorbed_b": career_abs_f2,
+            "career_sig_absorbed_over_1500_a": career_abs_over_1500_f1,
+            "career_sig_absorbed_over_1500_b": career_abs_over_1500_f2,
+        }
+        prefight_ba = {
+            "elo_a": elo_f2,
+            "elo_b": elo_f1,
+            "days_a": days_f2,
+            "days_b": days_f1,
+            "age_a_days": age_days_f2,
+            "age_b_days": age_days_f1,
+            "age_diff_years": -age_diff_years,
+            "age_gap_over_5y": age_gap_over_5y,
+            "height_a_cm": height_f2,
+            "height_b_cm": height_f1,
+            "reach_a_cm": reach_f2,
+            "reach_b_cm": reach_f1,
+            "career_sig_absorbed_a": career_abs_f2,
+            "career_sig_absorbed_b": career_abs_f1,
+            "career_sig_absorbed_over_1500_a": career_abs_over_1500_f2,
+            "career_sig_absorbed_over_1500_b": career_abs_over_1500_f1,
+        }
 
         static_ab = build_static_features(
             f1_eng[i],
@@ -533,6 +740,7 @@ def build_augmented_samples(
             int(f2_len[i]),
             recency_mode=static_recency_mode,
             ema_alpha=ema_alpha,
+            prefight_context=prefight_ab,
         )
         samples.append(
             SequenceSample(
@@ -554,6 +762,7 @@ def build_augmented_samples(
             int(f1_len[i]),
             recency_mode=static_recency_mode,
             ema_alpha=ema_alpha,
+            prefight_context=prefight_ba,
         )
         samples.append(
             SequenceSample(
@@ -903,6 +1112,10 @@ def train_model(
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    base_lr = float(args.lr)
+    warmup_epochs = max(0, int(args.warmup_epochs))
+    min_epochs = max(1, int(args.min_epochs))
+    min_delta = float(max(args.min_delta, 0.0))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -931,6 +1144,11 @@ def train_model(
     history: list[dict[str, float]] = []
 
     for epoch in range(1, args.epochs + 1):
+        if warmup_epochs > 0 and epoch <= warmup_epochs:
+            warmup_scale = float(epoch) / float(warmup_epochs)
+            for group in optimizer.param_groups:
+                group["lr"] = max(base_lr * warmup_scale, 1e-7)
+
         train_loss, _, _ = run_epoch(
             model,
             train_loader,
@@ -947,7 +1165,8 @@ def train_model(
             device=device,
             grad_clip=args.grad_clip,
         )
-        scheduler.step(val_loss)
+        if epoch > warmup_epochs:
+            scheduler.step(val_loss)
         val_auc = safe_auc(val_true, val_prob)
         val_bal = evaluate_probs(val_true, val_prob, threshold=0.5)["balanced_accuracy"]
         score = val_auc if not math.isnan(val_auc) else val_bal
@@ -972,16 +1191,17 @@ def train_model(
             float(optimizer.param_groups[0]["lr"]),
         )
 
-        if score > best_auc:
+        if score > (best_auc + min_delta):
             best_auc = score
             best_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch
             epochs_without_improvement = 0
         else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= args.patience:
-                logging.info("Early stopping at epoch %d", epoch)
-                break
+            if epoch >= min_epochs:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= args.patience:
+                    logging.info("Early stopping at epoch %d", epoch)
+                    break
 
     if best_state is None:
         best_state = copy.deepcopy(model.state_dict())
@@ -1063,6 +1283,15 @@ def main() -> int:
     set_seed(args.seed)
     device = resolve_device(args.device)
     logging.info("Using device: %s", device)
+    if args.warmup_epochs < 0:
+        raise ValueError("--warmup-epochs must be >= 0")
+    if args.min_epochs < 1:
+        raise ValueError("--min-epochs must be >= 1")
+    if args.min_delta < 0:
+        raise ValueError("--min-delta must be >= 0")
+    if args.min_epochs > args.epochs:
+        logging.warning("min_epochs (%d) > epochs (%d); clamping to epochs.", args.min_epochs, args.epochs)
+        args.min_epochs = args.epochs
     logging.info(
         "Options | bidirectional=%s | cross_attention=%s | recency_mode=%s | ema_alpha=%.3f",
         args.bidirectional,
@@ -1171,6 +1400,9 @@ def main() -> int:
         "static_recency_mode": str(args.static_recency_mode),
         "ema_alpha": float(args.ema_alpha),
         "dropout": args.dropout,
+        "warmup_epochs": int(args.warmup_epochs),
+        "min_epochs": int(args.min_epochs),
+        "min_delta": float(args.min_delta),
         "threshold": float(threshold),
         "drop_empty_history": bool(args.drop_empty_history),
     }

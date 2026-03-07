@@ -9,92 +9,123 @@
   <body>
     <main class="shell">
       <section class="hero panel">
-        <p class="kicker">UFC Training Console</p>
-        <h1>Data + Sequence LSTM Pipeline</h1>
-        <p class="subhead">
-          Run data jobs and train <code>{{ script_path }}</code> directly from the browser.
-        </p>
+        <div class="hero-top">
+          <p class="kicker">UFC Training Console</p>
+          <h1>Data + Sequence LSTM Pipeline</h1>
+          <p class="subhead">
+            Production-style control center for scraping, validation, and sequence-model training.
+          </p>
+          <p class="subhead small">
+            Active trainer: <code>{{ script_path }}</code>
+          </p>
+        </div>
+        <div class="hero-tags" aria-label="Pipeline stages">
+          <span class="hero-tag">Scrape</span>
+          <span class="hero-tag">Build Sequences</span>
+          <span class="hero-tag">Audit</span>
+          <span class="hero-tag">Train</span>
+        </div>
       </section>
 
-      <section class="panel">
-        <h2>Data Pipeline</h2>
+      <section class="panel data-panel">
+        <div class="panel-head">
+          <h2>Data Pipeline</h2>
+          <p class="panel-subhead">Run and monitor ingestion and data-quality steps.</p>
+        </div>
+
         <div class="status-row">
-          <div>
+          <div class="stat-tile">
             <p class="label">State</p>
             <p id="dataStateBadge" class="state-badge state-idle">idle</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Job ID</p>
             <p id="dataRunId">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Action</p>
             <p id="dataAction">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Started (UTC)</p>
             <p id="dataStartedAt">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Finished (UTC)</p>
             <p id="dataFinishedAt">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Exit Code</p>
             <p id="dataExitCode">-</p>
           </div>
         </div>
+
         <div id="dataFlash" class="flash hidden"></div>
-        <div class="button-row">
+
+        <div class="button-row data-actions">
           <button type="button" class="data-action-btn" data-action="update_data">Update Data</button>
           <button type="button" class="data-action-btn warn" data-action="reset_data">Reset Data + Rescrape</button>
           <button type="button" class="data-action-btn" data-action="build_sequences">Build Sequences</button>
           <button type="button" class="data-action-btn" data-action="audit_data">Audit Data</button>
           <button id="stopDataBtn" type="button" class="secondary">Stop Data Job</button>
         </div>
+
         <p class="hint">
-          <strong>Update Data:</strong> continue from checkpoint. <strong>Reset Data + Rescrape:</strong> deletes
-          raw/sequence/checkpoint files and re-scrapes fresh.
+          <strong>Update Data</strong> continues from checkpoint. <strong>Reset Data + Rescrape</strong>
+          deletes raw/sequence/checkpoint files first.
         </p>
+
         <pre id="dataLogTail" class="log-box">No data job yet.</pre>
       </section>
 
       <section class="panel status-panel">
-        <h2>Training Status</h2>
+        <div class="panel-head">
+          <h2>Training Status</h2>
+          <p class="panel-subhead">Live run metadata and model optimization state.</p>
+        </div>
+
         <div class="status-row">
-          <div>
+          <div class="stat-tile">
             <p class="label">State</p>
             <p id="stateBadge" class="state-badge state-idle">idle</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Run ID</p>
             <p id="runId">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Started (UTC)</p>
             <p id="startedAt">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Finished (UTC)</p>
             <p id="finishedAt">-</p>
           </div>
-          <div>
+          <div class="stat-tile">
             <p class="label">Exit Code</p>
             <p id="exitCode">-</p>
           </div>
         </div>
+
         <div id="trainFlash" class="flash hidden"></div>
       </section>
 
       <section class="panel">
-        <h2>Hyperparameters</h2>
+        <div class="panel-head">
+          <h2>Hyperparameters</h2>
+          <p class="panel-subhead">Tune momentum LSTM + XGBoost ensemble settings before training.</p>
+        </div>
+
         <form id="trainForm" class="train-form">
           <div class="grid two">
             <label>Input CSV<input name="input_csv" value="{{ defaults.input_csv }}" /></label>
-            <label>Model Path<input name="model_path" value="{{ defaults.model_path }}" /></label>
+            <label>Momentum Model Path<input name="momentum_model_path" value="{{ defaults.momentum_model_path }}" /></label>
           </div>
           <div class="grid two">
-            <label>Scaler Path<input name="scaler_path" value="{{ defaults.scaler_path }}" /></label>
+            <label>Momentum Scaler Path<input name="momentum_scaler_path" value="{{ defaults.momentum_scaler_path }}" /></label>
+            <label>XGBoost Model Path<input name="xgb_model_path" value="{{ defaults.xgb_model_path }}" /></label>
+          </div>
+          <div class="grid two">
             <label>Metrics Path<input name="metrics_path" value="{{ defaults.metrics_path }}" /></label>
           </div>
 
@@ -114,6 +145,12 @@
 
           <div class="grid four">
             <label>Grad Clip<input type="number" name="grad_clip" value="{{ defaults.grad_clip }}" step="0.1" min="0.1" /></label>
+            <label>Warmup Epochs<input type="number" name="warmup_epochs" value="{{ defaults.warmup_epochs }}" min="0" /></label>
+            <label>Min Epochs<input type="number" name="min_epochs" value="{{ defaults.min_epochs }}" min="1" /></label>
+            <label>Min Delta<input type="number" name="min_delta" value="{{ defaults.min_delta }}" step="0.0001" min="0" /></label>
+          </div>
+
+          <div class="grid three">
             <label>Val Fraction<input type="number" name="val_fraction" value="{{ defaults.val_fraction }}" step="0.01" min="0.01" max="0.49" /></label>
             <label>Test Fraction<input type="number" name="test_fraction" value="{{ defaults.test_fraction }}" step="0.01" min="0.01" max="0.49" /></label>
             <label>Max Fights (optional)<input type="number" name="max_fights" value="{{ defaults.max_fights }}" min="1" placeholder="blank = full data" /></label>
@@ -130,6 +167,31 @@
               </select>
             </label>
             <label>EMA Alpha<input type="number" name="ema_alpha" value="{{ defaults.ema_alpha }}" step="0.01" min="0" max="1" /></label>
+          </div>
+
+          <div class="grid four">
+            <label>XGB Estimators<input type="number" name="xgb_n_estimators" value="{{ defaults.xgb_n_estimators }}" min="1" /></label>
+            <label>XGB LR<input type="number" name="xgb_lr" value="{{ defaults.xgb_lr }}" step="0.0001" min="0.0001" /></label>
+            <label>XGB Max Depth<input type="number" name="xgb_max_depth" value="{{ defaults.xgb_max_depth }}" min="1" /></label>
+            <label>XGB Min Child Weight<input type="number" name="xgb_min_child_weight" value="{{ defaults.xgb_min_child_weight }}" step="0.1" min="0.1" /></label>
+          </div>
+
+          <div class="grid four">
+            <label>XGB Subsample<input type="number" name="xgb_subsample" value="{{ defaults.xgb_subsample }}" step="0.01" min="0.01" max="1" /></label>
+            <label>XGB Colsample<input type="number" name="xgb_colsample_bytree" value="{{ defaults.xgb_colsample_bytree }}" step="0.01" min="0.01" max="1" /></label>
+            <label>XGB Reg Alpha<input type="number" name="xgb_reg_alpha" value="{{ defaults.xgb_reg_alpha }}" step="0.01" min="0" /></label>
+            <label>XGB Reg Lambda<input type="number" name="xgb_reg_lambda" value="{{ defaults.xgb_reg_lambda }}" step="0.01" min="0" /></label>
+          </div>
+
+          <div class="grid three">
+            <label>XGB Gamma<input type="number" name="xgb_gamma" value="{{ defaults.xgb_gamma }}" step="0.01" min="0" /></label>
+            <label>XGB Early Stopping<input type="number" name="xgb_early_stopping" value="{{ defaults.xgb_early_stopping }}" min="1" /></label>
+            <label>XGB N Jobs<input type="number" name="xgb_n_jobs" value="{{ defaults.xgb_n_jobs }}" /></label>
+          </div>
+
+          <div class="grid three">
+            <label>OOF Folds<input type="number" name="oof_folds" value="{{ defaults.oof_folds }}" min="1" /></label>
+            <label>OOF Min Train Fights<input type="number" name="oof_min_train_fights" value="{{ defaults.oof_min_train_fights }}" min="1" /></label>
           </div>
 
           <div class="grid four">
@@ -158,6 +220,7 @@
           <div class="grid three">
             <label class="toggle"><input id="bidirectional" type="checkbox" {% if defaults.bidirectional %}checked{% endif %} />Bidirectional LSTM</label>
             <label class="toggle"><input id="useCrossAttention" type="checkbox" {% if defaults.use_cross_attention %}checked{% endif %} />Use Cross-Attention</label>
+            <label class="toggle"><input id="useOofStacking" type="checkbox" {% if defaults.use_oof_stacking %}checked{% endif %} />Use OOF Stacking</label>
           </div>
 
           <div class="button-row">
@@ -168,15 +231,20 @@
       </section>
 
       <section class="panel">
-        <h2>Metrics</h2>
-        <div class="metrics-grid">
-          <div><p class="label">Best Epoch</p><p id="bestEpoch">-</p></div>
-          <div><p class="label">Threshold</p><p id="threshold">-</p></div>
-          <div><p class="label">Test Accuracy</p><p id="testAcc">-</p></div>
-          <div><p class="label">Test Balanced Accuracy</p><p id="testBalAcc">-</p></div>
-          <div><p class="label">Test AUC</p><p id="testAuc">-</p></div>
-          <div><p class="label">Test Log Loss</p><p id="testLogLoss">-</p></div>
+        <div class="panel-head">
+          <h2>Metrics</h2>
+          <p class="panel-subhead">Current best checkpoint summary and evaluation results.</p>
         </div>
+
+        <div class="metrics-grid">
+          <div class="metric-card"><p class="label">Best Epoch</p><p id="bestEpoch">-</p></div>
+          <div class="metric-card"><p class="label">Threshold</p><p id="threshold">-</p></div>
+          <div class="metric-card"><p class="label">Test Accuracy</p><p id="testAcc">-</p></div>
+          <div class="metric-card"><p class="label">Test Balanced Accuracy</p><p id="testBalAcc">-</p></div>
+          <div class="metric-card"><p class="label">Test AUC</p><p id="testAuc">-</p></div>
+          <div class="metric-card"><p class="label">Test Log Loss</p><p id="testLogLoss">-</p></div>
+        </div>
+
         <details>
           <summary>View Raw Metrics JSON</summary>
           <pre id="metricsJson" class="json-box">No metrics yet.</pre>
@@ -184,7 +252,10 @@
       </section>
 
       <section class="panel">
-        <h2>Training Log</h2>
+        <div class="panel-head">
+          <h2>Training Log</h2>
+          <p class="panel-subhead">Streaming optimizer output from the active run.</p>
+        </div>
         <pre id="logTail" class="log-box">No run yet.</pre>
       </section>
     </main>
@@ -236,10 +307,10 @@
       }
 
       function renderMetrics(metrics) {
-        const summary = metrics?.train_summary || {};
-        const test = metrics?.test_metrics || {};
+        const summary = metrics?.momentum_train_summary || metrics?.train_summary || {};
+        const test = metrics?.ensemble_test_metrics || metrics?.test_metrics || {};
         document.getElementById("bestEpoch").textContent = fmt(summary.best_epoch);
-        document.getElementById("threshold").textContent = fmtMetric(summary.threshold);
+        document.getElementById("threshold").textContent = fmtMetric(metrics?.ensemble_threshold ?? summary.threshold);
         document.getElementById("testAcc").textContent = fmtMetric(test.accuracy);
         document.getElementById("testBalAcc").textContent = fmtMetric(test.balanced_accuracy);
         document.getElementById("testAuc").textContent = fmtMetric(test.auc);
@@ -299,6 +370,7 @@
         const payload = Object.fromEntries(data.entries());
         payload.bidirectional = document.getElementById("bidirectional").checked;
         payload.use_cross_attention = document.getElementById("useCrossAttention").checked;
+        payload.use_oof_stacking = document.getElementById("useOofStacking").checked;
         return payload;
       }
 
