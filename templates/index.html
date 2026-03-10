@@ -3,482 +3,554 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>UFC LSTM Pipeline Console</title>
+    <title>UFC Prediction Desk</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script id="bootstrap-data" type="application/json">{{ bootstrap | tojson }}</script>
+    <script defer src="{{ url_for('static', filename='app.js') }}"></script>
   </head>
   <body>
-    <main class="shell">
-      <section class="hero panel">
-        <div class="hero-top">
-          <p class="kicker">UFC Training Console</p>
-          <h1>Data + Sequence LSTM Pipeline</h1>
-          <p class="subhead">
-            Production-style control center for scraping, validation, and sequence-model training.
-          </p>
-          <p class="subhead small">
-            Active trainer: <code>{{ script_path }}</code>
-          </p>
+    <main class="page-shell">
+      <section class="panel hero-panel">
+        <div class="hero-stage">
+          <div class="hero-copy">
+            <p class="eyebrow">UFC Betting Research Desk</p>
+            <h1>Prediction, journaling, and bankroll tracking in one place.</h1>
+            <p class="hero-text">
+              Focused workspace for matchup analysis, recommended bets, data refreshes, model promotion,
+              and a paper-ready research trail.
+            </p>
+            <div class="hero-ribbon" aria-label="Desk capabilities">
+              <span class="hero-chip">Prediction Engine</span>
+              <span class="hero-chip">Bet Journal</span>
+              <span class="hero-chip">Research Export</span>
+              <span class="hero-chip">Data Refresh</span>
+            </div>
+            <div class="hero-actions">
+              <button id="exportSnapshotBtn" type="button" class="secondary">Export Research Snapshot</button>
+            </div>
+          </div>
+
+          <aside class="hero-aside">
+            <p class="meta-label">Paper Mode</p>
+            <h2>Build a research trail, not just a picks page.</h2>
+            <p class="hero-note">
+              Save predictions before you bet, log the exact line you took, and keep the underlying model
+              and data refresh cycle close to the betting workflow.
+            </p>
+            <div class="hero-note-grid">
+              <div class="hero-note-card">
+                <span class="hero-note-value">1.</span>
+                <p>Analyze the fight with market odds.</p>
+              </div>
+              <div class="hero-note-card">
+                <span class="hero-note-value">2.</span>
+                <p>Save the prediction as a paper artifact.</p>
+              </div>
+              <div class="hero-note-card">
+                <span class="hero-note-value">3.</span>
+                <p>Log the actual bet and settle the result later.</p>
+              </div>
+            </div>
+          </aside>
         </div>
-        <div class="hero-tags" aria-label="Pipeline stages">
-          <span class="hero-tag">Scrape</span>
-          <span class="hero-tag">Build Sequences</span>
-          <span class="hero-tag">Audit</span>
-          <span class="hero-tag">Train</span>
+
+        <div class="hero-grid">
+          <article class="hero-card">
+            <p class="meta-label">Deployed Model</p>
+            <h2 id="heroModelLabel">-</h2>
+            <p id="heroModelAuc" class="hero-number">-</p>
+          </article>
+          <article class="hero-card">
+            <p class="meta-label">Open Bets</p>
+            <p id="heroOpenBets" class="hero-number">-</p>
+            <p class="meta-copy">Live tickets awaiting settlement</p>
+          </article>
+          <article class="hero-card">
+            <p class="meta-label">Net PnL</p>
+            <p id="heroNetPnl" class="hero-number">-</p>
+            <p id="heroRoi" class="meta-copy">-</p>
+          </article>
+          <article class="hero-card">
+            <p class="meta-label">Data Freshness</p>
+            <p id="heroDataFreshness" class="hero-number small">-</p>
+            <p class="meta-copy">Latest tracked dataset update</p>
+          </article>
         </div>
       </section>
 
-      <section class="panel data-panel">
-        <div class="panel-head">
-          <h2>Data Pipeline</h2>
-          <p class="panel-subhead">Run and monitor ingestion and data-quality steps.</p>
-        </div>
-
-        <div class="status-row">
-          <div class="stat-tile">
-            <p class="label">State</p>
-            <p id="dataStateBadge" class="state-badge state-idle">idle</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Job ID</p>
-            <p id="dataRunId">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Action</p>
-            <p id="dataAction">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Started (UTC)</p>
-            <p id="dataStartedAt">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Finished (UTC)</p>
-            <p id="dataFinishedAt">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Exit Code</p>
-            <p id="dataExitCode">-</p>
-          </div>
-        </div>
-
-        <div id="dataFlash" class="flash hidden"></div>
-
-        <div class="button-row data-actions">
-          <button type="button" class="data-action-btn" data-action="update_data">Update Data</button>
-          <button type="button" class="data-action-btn warn" data-action="reset_data">Reset Data + Rescrape</button>
-          <button type="button" class="data-action-btn" data-action="build_sequences">Build Sequences</button>
-          <button type="button" class="data-action-btn" data-action="audit_data">Audit Data</button>
-          <button id="stopDataBtn" type="button" class="secondary">Stop Data Job</button>
-        </div>
-
-        <p class="hint">
-          <strong>Update Data</strong> continues from checkpoint. <strong>Reset Data + Rescrape</strong>
-          deletes raw/sequence/checkpoint files first.
-        </p>
-
-        <pre id="dataLogTail" class="log-box">No data job yet.</pre>
-      </section>
-
-      <section class="panel status-panel">
-        <div class="panel-head">
-          <h2>Training Status</h2>
-          <p class="panel-subhead">Live run metadata and model optimization state.</p>
-        </div>
-
-        <div class="status-row">
-          <div class="stat-tile">
-            <p class="label">State</p>
-            <p id="stateBadge" class="state-badge state-idle">idle</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Run ID</p>
-            <p id="runId">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Started (UTC)</p>
-            <p id="startedAt">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Finished (UTC)</p>
-            <p id="finishedAt">-</p>
-          </div>
-          <div class="stat-tile">
-            <p class="label">Exit Code</p>
-            <p id="exitCode">-</p>
-          </div>
-        </div>
-
-        <div id="trainFlash" class="flash hidden"></div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Hyperparameters</h2>
-          <p class="panel-subhead">Tune momentum LSTM + XGBoost ensemble settings before training.</p>
-        </div>
-
-        <form id="trainForm" class="train-form">
-          <div class="grid two">
-            <label>Input CSV<input name="input_csv" value="{{ defaults.input_csv }}" /></label>
-            <label>Momentum Model Path<input name="momentum_model_path" value="{{ defaults.momentum_model_path }}" /></label>
-          </div>
-          <div class="grid two">
-            <label>Momentum Scaler Path<input name="momentum_scaler_path" value="{{ defaults.momentum_scaler_path }}" /></label>
-            <label>XGBoost Model Path<input name="xgb_model_path" value="{{ defaults.xgb_model_path }}" /></label>
-          </div>
-          <div class="grid two">
-            <label>Metrics Path<input name="metrics_path" value="{{ defaults.metrics_path }}" /></label>
+      <section class="main-grid">
+        <section class="panel prediction-panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-kicker">Prediction Lab</p>
+              <h2>Analyze a matchup and build the bet slip.</h2>
+            </div>
+            <button id="swapFightersBtn" type="button" class="ghost">Swap Fighters</button>
           </div>
 
-          <div class="grid four">
-            <label>Epochs<input type="number" name="epochs" value="{{ defaults.epochs }}" min="1" /></label>
-            <label>Patience<input type="number" name="patience" value="{{ defaults.patience }}" min="1" /></label>
-            <label>Batch Size<input type="number" name="batch_size" value="{{ defaults.batch_size }}" min="1" /></label>
-            <label>Hidden Size<input type="number" name="hidden_size" value="{{ defaults.hidden_size }}" min="1" /></label>
+          <div id="analysisFlash" class="flash hidden"></div>
+
+          <div class="prediction-canvas">
+            <div class="canvas-badge">Tape to Ticket</div>
+            <form id="analysisForm" class="form-grid">
+              <div class="field-grid four">
+                <label>
+                  Event
+                  <input id="eventNameInput" name="event_name" placeholder="UFC Fight Night" />
+                </label>
+                <label>
+                  Event Date
+                  <input id="eventDateInput" name="event_date" type="date" />
+                </label>
+                <label>
+                  Weight Class
+                  <input id="weightClassInput" name="weight_class" placeholder="Lightweight" />
+                </label>
+                <label>
+                  Gender
+                  <select id="genderInput" name="gender">
+                    <option value="">Auto</option>
+                    <option value="M">Men</option>
+                    <option value="F">Women</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="field-grid four matchup-grid">
+                <label>
+                  Fighter 1
+                  <input id="fighterOneInput" name="fighter_1" list="fighterNamesList" placeholder="Start typing a fighter..." required />
+                </label>
+                <label>
+                  Fighter 2
+                  <input id="fighterTwoInput" name="fighter_2" list="fighterNamesList" placeholder="Start typing a fighter..." required />
+                </label>
+                <label>
+                  Scheduled Rounds
+                  <input id="scheduledRoundsInput" name="scheduled_rounds" type="number" min="1" max="5" value="3" />
+                </label>
+                <label class="toggle-field">
+                  Title Bout
+                  <span class="toggle-row">
+                    <input id="titleBoutInput" name="is_title_bout" type="checkbox" />
+                    <span>Enable if this is a championship fight</span>
+                  </span>
+                </label>
+              </div>
+
+              <div class="matchup-banner">
+                <span class="matchup-banner-pill">Fight Card</span>
+                <p>Compare the model against the market, then turn the best edge into a logged bet.</p>
+              </div>
+
+              <div class="field-grid four">
+                <label>
+                  Fighter 1 Odds
+                  <input id="oddsFighterOneInput" name="odds_fighter_1" type="number" step="1" placeholder="-145 or +130" />
+                </label>
+                <label>
+                  Fighter 2 Odds
+                  <input id="oddsFighterTwoInput" name="odds_fighter_2" type="number" step="1" placeholder="+125 or -160" />
+                </label>
+                <label>
+                  Bankroll (units)
+                  <input id="bankrollInput" name="bankroll_units" type="number" min="1" step="0.1" value="100" />
+                </label>
+                <label>
+                  Sportsbook
+                  <input id="sportsbookInput" name="sportsbook" placeholder="DraftKings, FanDuel, etc." />
+                </label>
+              </div>
+
+              <div class="field-grid four">
+                <label>
+                  Pick
+                  <select id="pickSelect" name="pick">
+                    <option value="">Select bet side</option>
+                  </select>
+                </label>
+                <label>
+                  Bet Odds
+                  <input id="betOddsInput" name="american_odds" type="number" step="1" placeholder="Auto-filled from pick" />
+                </label>
+                <label>
+                  Stake (units)
+                  <input id="stakeInput" name="stake" type="number" min="0.1" step="0.01" placeholder="1.00" />
+                </label>
+                <label>
+                  Market
+                  <select id="marketTypeInput" name="market_type">
+                    <option value="moneyline">Moneyline</option>
+                  </select>
+                </label>
+              </div>
+
+              <label>
+                Notes
+                <textarea id="notesInput" name="notes" rows="3" placeholder="Reasoning, tape notes, line movement, or research notes for the paper."></textarea>
+              </label>
+
+              <div class="button-row">
+                <button id="analyzeBtn" type="button">Analyze Fight</button>
+                <button id="savePredictionBtn" type="button" class="secondary">Save Analysis</button>
+                <button id="useRecommendationBtn" type="button" class="ghost">Use Recommendation</button>
+                <button id="addBetBtn" type="button" class="accent">Log Bet</button>
+              </div>
+            </form>
+
+            <div class="analysis-output">
+              <article id="predictionSummaryCard" class="summary-card muted-card editorial-card">
+                <p class="meta-label">Model Read</p>
+                <h3 id="predictionHeadline">Run an analysis to see the projection.</h3>
+                <p id="predictionBody" class="support-copy">
+                  The desk will estimate win probability, confidence, and a recommended moneyline bet when both sides have odds.
+                </p>
+              </article>
+
+              <article class="summary-card">
+                <div class="summary-top">
+                  <div>
+                    <p class="meta-label">Market Comparison</p>
+                    <h3>Value scan</h3>
+                  </div>
+                </div>
+                <div class="table-wrap compact-wrap">
+                  <table class="compact-table">
+                    <thead>
+                      <tr>
+                        <th>Side</th>
+                        <th>Model</th>
+                        <th>Implied</th>
+                        <th>Edge</th>
+                        <th>EV/u</th>
+                      </tr>
+                    </thead>
+                    <tbody id="candidateOddsBody">
+                      <tr>
+                        <td colspan="5" class="empty-cell">No market comparison yet.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+
+            <div class="insight-grid">
+              <article class="insight-card">
+                <p class="meta-label">Confidence</p>
+                <p id="analysisConfidenceValue">-</p>
+                <p class="support-copy">Distance between both sides after blending.</p>
+              </article>
+              <article class="insight-card">
+                <p class="meta-label">Fair Line: Fighter 1</p>
+                <p id="analysisFairOddsF1">-</p>
+                <p class="support-copy">Model-derived break-even moneyline.</p>
+              </article>
+              <article class="insight-card">
+                <p class="meta-label">Fair Line: Fighter 2</p>
+                <p id="analysisFairOddsF2">-</p>
+                <p class="support-copy">Model-derived break-even moneyline.</p>
+              </article>
+              <article class="insight-card">
+                <p class="meta-label">Market Signal</p>
+                <p id="analysisMarketSignal">-</p>
+                <p id="analysisTimestamp" class="support-copy">No analysis yet.</p>
+              </article>
+            </div>
           </div>
 
-          <div class="grid four">
-            <label>Num Layers<input type="number" name="num_layers" value="{{ defaults.num_layers }}" min="1" /></label>
-            <label>Dropout<input type="number" name="dropout" value="{{ defaults.dropout }}" step="0.01" min="0" max="0.99" /></label>
-            <label>Learning Rate<input type="number" name="lr" value="{{ defaults.lr }}" step="0.00001" min="0.000001" /></label>
-            <label>Weight Decay<input type="number" name="weight_decay" value="{{ defaults.weight_decay }}" step="0.00001" min="0" /></label>
-          </div>
+          <datalist id="fighterNamesList">
+            {% for fighter_name in fighter_names %}
+              <option value="{{ fighter_name }}"></option>
+            {% endfor %}
+          </datalist>
+        </section>
 
-          <div class="grid four">
-            <label>Grad Clip<input type="number" name="grad_clip" value="{{ defaults.grad_clip }}" step="0.1" min="0.1" /></label>
-            <label>Warmup Epochs<input type="number" name="warmup_epochs" value="{{ defaults.warmup_epochs }}" min="0" /></label>
-            <label>Min Epochs<input type="number" name="min_epochs" value="{{ defaults.min_epochs }}" min="1" /></label>
-            <label>Min Delta<input type="number" name="min_delta" value="{{ defaults.min_delta }}" step="0.0001" min="0" /></label>
-          </div>
+        <aside class="side-stack">
+          <section class="panel side-panel">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">Model Control</p>
+                <h2>Deploy and refresh the predictor.</h2>
+              </div>
+            </div>
 
-          <div class="grid three">
-            <label>Val Fraction<input type="number" name="val_fraction" value="{{ defaults.val_fraction }}" step="0.01" min="0.01" max="0.49" /></label>
-            <label>Test Fraction<input type="number" name="test_fraction" value="{{ defaults.test_fraction }}" step="0.01" min="0.01" max="0.49" /></label>
-            <label>Max Fights (optional)<input type="number" name="max_fights" value="{{ defaults.max_fights }}" min="1" placeholder="blank = full data" /></label>
-          </div>
+            <div id="modelFlash" class="flash hidden"></div>
 
-          <div class="grid four">
-            <label>Attention Heads<input type="number" name="attention_heads" value="{{ defaults.attention_heads }}" min="1" /></label>
-            <label>Attention Dropout<input type="number" name="attention_dropout" value="{{ defaults.attention_dropout }}" step="0.01" min="0" max="0.99" /></label>
+            <div class="stack-card">
+              <p class="meta-label">Live Model</p>
+              <h3 id="modelSummary">-</h3>
+              <p id="modelDetail" class="support-copy">-</p>
+            </div>
+
             <label>
-              Recency Mode
-              <select name="static_recency_mode">
-                <option value="ema" {% if defaults.static_recency_mode == "ema" %}selected{% endif %}>ema</option>
-                <option value="mean" {% if defaults.static_recency_mode == "mean" %}selected{% endif %}>mean</option>
-              </select>
+              Available Models
+              <select id="modelSelect"></select>
             </label>
-            <label>EMA Alpha<input type="number" name="ema_alpha" value="{{ defaults.ema_alpha }}" step="0.01" min="0" max="1" /></label>
-          </div>
 
-          <div class="grid four">
-            <label>XGB Estimators<input type="number" name="xgb_n_estimators" value="{{ defaults.xgb_n_estimators }}" min="1" /></label>
-            <label>XGB LR<input type="number" name="xgb_lr" value="{{ defaults.xgb_lr }}" step="0.0001" min="0.0001" /></label>
-            <label>XGB Max Depth<input type="number" name="xgb_max_depth" value="{{ defaults.xgb_max_depth }}" min="1" /></label>
-            <label>XGB Min Child Weight<input type="number" name="xgb_min_child_weight" value="{{ defaults.xgb_min_child_weight }}" step="0.1" min="0.1" /></label>
-          </div>
+            <div class="button-row">
+              <button id="deployModelBtn" type="button">Deploy Selected</button>
+              <button id="reloadModelBtn" type="button" class="secondary">Reload Artifacts</button>
+            </div>
 
-          <div class="grid four">
-            <label>XGB Subsample<input type="number" name="xgb_subsample" value="{{ defaults.xgb_subsample }}" step="0.01" min="0.01" max="1" /></label>
-            <label>XGB Colsample<input type="number" name="xgb_colsample_bytree" value="{{ defaults.xgb_colsample_bytree }}" step="0.01" min="0.01" max="1" /></label>
-            <label>XGB Reg Alpha<input type="number" name="xgb_reg_alpha" value="{{ defaults.xgb_reg_alpha }}" step="0.01" min="0" /></label>
-            <label>XGB Reg Lambda<input type="number" name="xgb_reg_lambda" value="{{ defaults.xgb_reg_lambda }}" step="0.01" min="0" /></label>
-          </div>
+            <div class="button-row">
+              <button id="retrainModelBtn" type="button" class="accent">Retrain Candidate</button>
+              <button id="stopTrainBtn" type="button" class="ghost">Stop Training</button>
+            </div>
 
-          <div class="grid three">
-            <label>XGB Gamma<input type="number" name="xgb_gamma" value="{{ defaults.xgb_gamma }}" step="0.01" min="0" /></label>
-            <label>XGB Early Stopping<input type="number" name="xgb_early_stopping" value="{{ defaults.xgb_early_stopping }}" min="1" /></label>
-            <label>XGB N Jobs<input type="number" name="xgb_n_jobs" value="{{ defaults.xgb_n_jobs }}" /></label>
-          </div>
+            <div class="status-cluster">
+              <div class="mini-status">
+                <p class="meta-label">Training State</p>
+                <p id="trainStateText" class="pill pill-neutral">idle</p>
+              </div>
+              <div class="mini-status">
+                <p class="meta-label">Latest Candidate</p>
+                <p id="latestCandidateText">None yet</p>
+              </div>
+            </div>
+          </section>
 
-          <div class="grid three">
-            <label>OOF Folds<input type="number" name="oof_folds" value="{{ defaults.oof_folds }}" min="1" /></label>
-            <label>OOF Min Train Fights<input type="number" name="oof_min_train_fights" value="{{ defaults.oof_min_train_fights }}" min="1" /></label>
-          </div>
+          <section class="panel side-panel">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">Recommended Bet</p>
+                <h2>Bankroll-sized moneyline recommendation.</h2>
+              </div>
+            </div>
 
-          <div class="grid four">
-            <label>Seed<input type="number" name="seed" value="{{ defaults.seed }}" min="0" /></label>
-            <label>
-              Device
-              <select name="device">
-                <option value="auto" {% if defaults.device == "auto" %}selected{% endif %}>auto</option>
-                <option value="cpu" {% if defaults.device == "cpu" %}selected{% endif %}>cpu</option>
-                <option value="cuda" {% if defaults.device == "cuda" %}selected{% endif %}>cuda</option>
-                <option value="mps" {% if defaults.device == "mps" %}selected{% endif %}>mps</option>
-              </select>
-            </label>
-            <label>Num Workers<input type="number" name="num_workers" value="{{ defaults.num_workers }}" min="0" /></label>
-            <label>
-              Log Level
-              <select name="log_level">
-                <option value="DEBUG" {% if defaults.log_level == "DEBUG" %}selected{% endif %}>DEBUG</option>
-                <option value="INFO" {% if defaults.log_level == "INFO" %}selected{% endif %}>INFO</option>
-                <option value="WARNING" {% if defaults.log_level == "WARNING" %}selected{% endif %}>WARNING</option>
-                <option value="ERROR" {% if defaults.log_level == "ERROR" %}selected{% endif %}>ERROR</option>
-              </select>
-            </label>
-          </div>
+            <div id="recommendationEmpty" class="empty-state">
+              Analyze a fight with both moneylines to generate a recommendation.
+            </div>
 
-          <div class="grid three">
-            <label class="toggle"><input id="bidirectional" type="checkbox" {% if defaults.bidirectional %}checked{% endif %} />Bidirectional LSTM</label>
-            <label class="toggle"><input id="useCrossAttention" type="checkbox" {% if defaults.use_cross_attention %}checked{% endif %} />Use Cross-Attention</label>
-            <label class="toggle"><input id="useOofStacking" type="checkbox" {% if defaults.use_oof_stacking %}checked{% endif %} />Use OOF Stacking</label>
-          </div>
+            <div id="recommendationCard" class="recommendation-card hidden">
+              <div class="recommendation-top">
+                <p id="recommendationVerdict" class="pill pill-neutral">pass</p>
+                <p id="recommendationPick" class="recommendation-pick">-</p>
+              </div>
+              <p id="recommendationSummary" class="support-copy">-</p>
+              <div class="metric-strip">
+                <div>
+                  <p class="meta-label">Edge</p>
+                  <p id="recommendationEdge">-</p>
+                </div>
+                <div>
+                  <p class="meta-label">EV / unit</p>
+                  <p id="recommendationEv">-</p>
+                </div>
+                <div>
+                  <p class="meta-label">Kelly</p>
+                  <p id="recommendationKelly">-</p>
+                </div>
+                <div>
+                  <p class="meta-label">Recommended</p>
+                  <p id="recommendationStake">-</p>
+                </div>
+              </div>
+            </div>
+          </section>
 
-          <div class="button-row">
-            <button id="startBtn" type="submit">Start Training</button>
-            <button id="stopBtn" type="button" class="secondary">Stop Active Run</button>
-          </div>
-        </form>
+          <section class="panel side-panel">
+            <div class="panel-head">
+              <div>
+                <p class="section-kicker">Maintenance</p>
+                <h2>Refresh data and feature pipelines.</h2>
+              </div>
+            </div>
+
+            <div id="maintenanceFlash" class="flash hidden"></div>
+
+            <div class="status-cluster">
+              <div class="mini-status">
+                <p class="meta-label">Pipeline State</p>
+                <p id="pipelineStateText" class="pill pill-neutral">idle</p>
+              </div>
+              <div class="mini-status">
+                <p class="meta-label">Latest Action</p>
+                <p id="pipelineActionText">-</p>
+              </div>
+            </div>
+
+            <div class="button-grid">
+              <button type="button" class="maintenance-btn" data-action="update_data">Update Data</button>
+              <button type="button" class="maintenance-btn" data-action="build_sequences">Build Sequences</button>
+              <button type="button" class="maintenance-btn" data-action="audit_data">Audit Data</button>
+              <button type="button" class="maintenance-btn warn" data-action="reset_data">Reset + Rescrape</button>
+            </div>
+
+            <div class="button-row">
+              <button id="stopPipelineBtn" type="button" class="ghost">Stop Pipeline</button>
+            </div>
+          </section>
+        </aside>
       </section>
 
-      <section class="panel">
+      <section class="panel metrics-panel">
         <div class="panel-head">
-          <h2>Metrics</h2>
-          <p class="panel-subhead">Current best checkpoint summary and evaluation results.</p>
+          <div>
+            <p class="section-kicker">Research Snapshot</p>
+            <h2>Live bankroll and prediction metrics.</h2>
+          </div>
         </div>
 
         <div class="metrics-grid">
-          <div class="metric-card"><p class="label">Best Epoch</p><p id="bestEpoch">-</p></div>
-          <div class="metric-card"><p class="label">Threshold</p><p id="threshold">-</p></div>
-          <div class="metric-card"><p class="label">Test Accuracy</p><p id="testAcc">-</p></div>
-          <div class="metric-card"><p class="label">Test Balanced Accuracy</p><p id="testBalAcc">-</p></div>
-          <div class="metric-card"><p class="label">Test AUC</p><p id="testAuc">-</p></div>
-          <div class="metric-card"><p class="label">Test Log Loss</p><p id="testLogLoss">-</p></div>
+          <article class="metric-card">
+            <p class="meta-label">Open Bets</p>
+            <p id="metricOpenBets">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">Settled Bets</p>
+            <p id="metricSettledBets">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">Win Rate</p>
+            <p id="metricWinRate">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">ROI</p>
+            <p id="metricRoi">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">Net PnL</p>
+            <p id="metricPnl">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">Avg Edge</p>
+            <p id="metricAvgEdge">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">Saved Predictions</p>
+            <p id="metricPredictions">-</p>
+          </article>
+          <article class="metric-card">
+            <p class="meta-label">Recommended Picks</p>
+            <p id="metricRecommended">-</p>
+          </article>
         </div>
-
-        <details>
-          <summary>View Raw Metrics JSON</summary>
-          <pre id="metricsJson" class="json-box">No metrics yet.</pre>
-        </details>
       </section>
 
-      <section class="panel">
-        <div class="panel-head">
-          <h2>Training Log</h2>
-          <p class="panel-subhead">Streaming optimizer output from the active run.</p>
-        </div>
-        <pre id="logTail" class="log-box">No run yet.</pre>
+      <section class="content-grid">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-kicker">Bet Tracker</p>
+              <h2>Open and settled bets.</h2>
+            </div>
+          </div>
+          <div class="table-toolbar">
+            <label class="toolbar-field">
+              Search
+              <input id="betsSearchInput" type="search" placeholder="Event, fighter, pick..." />
+            </label>
+            <label class="toolbar-field">
+              View
+              <select id="betsFilterSelect">
+                <option value="all">All Bets</option>
+                <option value="open">Open Only</option>
+                <option value="settled">Settled Only</option>
+                <option value="recommended">Recommended Only</option>
+              </select>
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Event</th>
+                  <th>Matchup</th>
+                  <th>Pick</th>
+                  <th>Odds</th>
+                  <th>Prob</th>
+                  <th>Edge</th>
+                  <th>Stake</th>
+                  <th>Result</th>
+                  <th>PnL</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="betsTableBody">
+                <tr>
+                  <td colspan="11" class="empty-cell">No bets logged yet.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-kicker">Prediction Journal</p>
+              <h2>Saved analyses for paper writing and review.</h2>
+            </div>
+          </div>
+          <div class="table-toolbar">
+            <label class="toolbar-field">
+              Search
+              <input id="predictionsSearchInput" type="search" placeholder="Event, matchup, notes..." />
+            </label>
+            <label class="toolbar-field">
+              View
+              <select id="predictionsFilterSelect">
+                <option value="all">All Predictions</option>
+                <option value="recommended">Recommended Only</option>
+                <option value="strong">Strong Only</option>
+              </select>
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Saved</th>
+                  <th>Event</th>
+                  <th>Matchup</th>
+                  <th>Winner</th>
+                  <th>Confidence</th>
+                  <th>Recommendation</th>
+                  <th>Notes</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="predictionsTableBody">
+                <tr>
+                  <td colspan="9" class="empty-cell">No saved predictions yet.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="bottom-grid">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-kicker">Data Footprint</p>
+              <h2>Tracked data assets and freshness.</h2>
+            </div>
+          </div>
+          <div id="dataAssetsGrid" class="asset-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="section-kicker">Activity Logs</p>
+              <h2>Training and maintenance output.</h2>
+            </div>
+          </div>
+          <details class="log-block" open>
+            <summary>Training Log</summary>
+            <pre id="trainLogTail" class="log-box">No training activity yet.</pre>
+          </details>
+          <details class="log-block">
+            <summary>Pipeline Log</summary>
+            <pre id="pipelineLogTail" class="log-box">No pipeline activity yet.</pre>
+          </details>
+        </section>
       </section>
     </main>
-
-    <script>
-      const initialStatus = {{ status | tojson }};
-      const initialPipelineStatus = {{ pipeline_status | tojson }};
-      const trainForm = document.getElementById("trainForm");
-      const startBtn = document.getElementById("startBtn");
-      const stopBtn = document.getElementById("stopBtn");
-      const stopDataBtn = document.getElementById("stopDataBtn");
-      const trainFlash = document.getElementById("trainFlash");
-      const dataFlash = document.getElementById("dataFlash");
-      const logTail = document.getElementById("logTail");
-      const dataLogTail = document.getElementById("dataLogTail");
-      const dataActionButtons = [...document.querySelectorAll(".data-action-btn")];
-
-      let trainRunning = false;
-      let dataRunning = false;
-
-      function showFlash(node, message, kind) {
-        node.textContent = message;
-        node.classList.remove("hidden", "flash-error", "flash-ok");
-        node.classList.add(kind === "error" ? "flash-error" : "flash-ok");
-      }
-
-      function clearFlash(node) {
-        node.textContent = "";
-        node.classList.add("hidden");
-        node.classList.remove("flash-error", "flash-ok");
-      }
-
-      function setStateBadge(id, state) {
-        const badge = document.getElementById(id);
-        badge.textContent = state;
-        badge.className = "state-badge state-" + state;
-      }
-
-      function fmt(value) {
-        if (value === null || value === undefined || value === "") return "-";
-        return String(value);
-      }
-
-      function fmtMetric(value) {
-        if (value === null || value === undefined) return "-";
-        const n = Number(value);
-        if (Number.isNaN(n)) return "-";
-        return n.toFixed(4);
-      }
-
-      function renderMetrics(metrics) {
-        const summary = metrics?.momentum_train_summary || metrics?.train_summary || {};
-        const test = metrics?.ensemble_test_metrics || metrics?.test_metrics || {};
-        document.getElementById("bestEpoch").textContent = fmt(summary.best_epoch);
-        document.getElementById("threshold").textContent = fmtMetric(metrics?.ensemble_threshold ?? summary.threshold);
-        document.getElementById("testAcc").textContent = fmtMetric(test.accuracy);
-        document.getElementById("testBalAcc").textContent = fmtMetric(test.balanced_accuracy);
-        document.getElementById("testAuc").textContent = fmtMetric(test.auc);
-        document.getElementById("testLogLoss").textContent = fmtMetric(test.log_loss);
-        document.getElementById("metricsJson").textContent = metrics
-          ? JSON.stringify(metrics, null, 2)
-          : "No metrics yet.";
-      }
-
-      function syncButtonGuards() {
-        startBtn.disabled = trainRunning || dataRunning;
-        stopBtn.disabled = !trainRunning;
-        dataActionButtons.forEach((btn) => {
-          btn.disabled = trainRunning || dataRunning;
-        });
-        stopDataBtn.disabled = !dataRunning;
-      }
-
-      function renderStatus(status) {
-        setStateBadge("stateBadge", status.state || "idle");
-        document.getElementById("runId").textContent = fmt(status.run_id);
-        document.getElementById("startedAt").textContent = fmt(status.started_at_utc);
-        document.getElementById("finishedAt").textContent = fmt(status.finished_at_utc);
-        document.getElementById("exitCode").textContent = fmt(status.return_code);
-
-        trainRunning = Boolean(status.running);
-        syncButtonGuards();
-
-        const atBottom = Math.abs(logTail.scrollHeight - logTail.scrollTop - logTail.clientHeight) < 60;
-        logTail.textContent = status.log_tail || "No run yet.";
-        if (atBottom) {
-          logTail.scrollTop = logTail.scrollHeight;
-        }
-        renderMetrics(status.metrics);
-      }
-
-      function renderPipelineStatus(status) {
-        setStateBadge("dataStateBadge", status.state || "idle");
-        document.getElementById("dataRunId").textContent = fmt(status.run_id);
-        document.getElementById("dataAction").textContent = fmt(status.action_label);
-        document.getElementById("dataStartedAt").textContent = fmt(status.started_at_utc);
-        document.getElementById("dataFinishedAt").textContent = fmt(status.finished_at_utc);
-        document.getElementById("dataExitCode").textContent = fmt(status.return_code);
-
-        dataRunning = Boolean(status.running);
-        syncButtonGuards();
-
-        const atBottom = Math.abs(dataLogTail.scrollHeight - dataLogTail.scrollTop - dataLogTail.clientHeight) < 60;
-        dataLogTail.textContent = status.log_tail || "No data job yet.";
-        if (atBottom) {
-          dataLogTail.scrollTop = dataLogTail.scrollHeight;
-        }
-      }
-
-      function buildPayload() {
-        const data = new FormData(trainForm);
-        const payload = Object.fromEntries(data.entries());
-        payload.bidirectional = document.getElementById("bidirectional").checked;
-        payload.use_cross_attention = document.getElementById("useCrossAttention").checked;
-        payload.use_oof_stacking = document.getElementById("useOofStacking").checked;
-        return payload;
-      }
-
-      async function refreshStatus() {
-        try {
-          const [trainRes, dataRes] = await Promise.all([
-            fetch("/api/train/status?tail=1200"),
-            fetch("/api/pipeline/status?tail=1200"),
-          ]);
-          const trainBody = await trainRes.json();
-          const dataBody = await dataRes.json();
-          if (trainBody.ok) {
-            renderStatus(trainBody.status);
-          }
-          if (dataBody.ok) {
-            renderPipelineStatus(dataBody.status);
-          }
-        } catch (err) {
-          showFlash(trainFlash, "Could not refresh status: " + err, "error");
-        }
-      }
-
-      trainForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        clearFlash(trainFlash);
-        try {
-          const res = await fetch("/api/train/start", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(buildPayload()),
-          });
-          const body = await res.json();
-          if (!body.ok) {
-            throw new Error(body.error || "Failed to start training.");
-          }
-          showFlash(trainFlash, "Training started.", "ok");
-          renderStatus(body.status);
-        } catch (err) {
-          showFlash(trainFlash, String(err), "error");
-        }
-      });
-
-      stopBtn.addEventListener("click", async () => {
-        clearFlash(trainFlash);
-        try {
-          const res = await fetch("/api/train/stop", { method: "POST" });
-          const body = await res.json();
-          if (!body.ok) {
-            throw new Error(body.error || "Failed to stop training.");
-          }
-          showFlash(trainFlash, "Stop signal sent.", "ok");
-          renderStatus(body.status);
-        } catch (err) {
-          showFlash(trainFlash, String(err), "error");
-        }
-      });
-
-      dataActionButtons.forEach((button) => {
-        button.addEventListener("click", async () => {
-          const action = button.dataset.action;
-          clearFlash(dataFlash);
-
-          if (action === "reset_data") {
-            const ok = window.confirm(
-              "Reset Data + Rescrape will delete existing fight data, sequences, and scraper checkpoint before scraping again. Continue?"
-            );
-            if (!ok) {
-              return;
-            }
-          }
-
-          try {
-            const res = await fetch("/api/pipeline/start", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ action }),
-            });
-            const body = await res.json();
-            if (!body.ok) {
-              throw new Error(body.error || "Failed to start pipeline action.");
-            }
-            showFlash(dataFlash, `Started ${button.textContent}.`, "ok");
-            renderPipelineStatus(body.status);
-          } catch (err) {
-            showFlash(dataFlash, String(err), "error");
-          }
-        });
-      });
-
-      stopDataBtn.addEventListener("click", async () => {
-        clearFlash(dataFlash);
-        try {
-          const res = await fetch("/api/pipeline/stop", { method: "POST" });
-          const body = await res.json();
-          if (!body.ok) {
-            throw new Error(body.error || "Failed to stop data job.");
-          }
-          showFlash(dataFlash, "Stop signal sent for data job.", "ok");
-          renderPipelineStatus(body.status);
-        } catch (err) {
-          showFlash(dataFlash, String(err), "error");
-        }
-      });
-
-      renderStatus(initialStatus);
-      renderPipelineStatus(initialPipelineStatus);
-      setInterval(refreshStatus, 2000);
-      refreshStatus();
-    </script>
   </body>
 </html>

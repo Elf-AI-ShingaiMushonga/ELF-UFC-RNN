@@ -125,6 +125,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.15, help="Validation split fraction.")
     parser.add_argument("--test-fraction", type=float, default=0.15, help="Test split fraction.")
     parser.add_argument(
+        "--holdout-manifest-path",
+        type=Path,
+        default=root_dir / "data" / "model_cache" / "final_holdout_fight_ids.txt",
+        help="Path to locked chronological holdout fight IDs. Created on first run and reused thereafter.",
+    )
+    parser.add_argument(
+        "--refresh-holdout-manifest",
+        action="store_true",
+        help="Regenerate holdout manifest from current chronology (overwrites existing holdout IDs).",
+    )
+    parser.add_argument(
         "--drop-empty-history",
         dest="drop_empty_history",
         action="store_true",
@@ -258,6 +269,25 @@ def parse_args() -> argparse.Namespace:
         help="Disable trend/volatility/opponent-adjusted static features for XGBoost.",
     )
     parser.set_defaults(use_trend_static_features=True)
+    parser.add_argument(
+        "--enhanced-context-static-features",
+        dest="use_enhanced_context_static_features",
+        action="store_true",
+        help="Enable richer age/rust/quality interaction features for XGBoost.",
+    )
+    parser.add_argument(
+        "--no-enhanced-context-static-features",
+        dest="use_enhanced_context_static_features",
+        action="store_false",
+        help="Disable richer age/rust/quality interaction features for XGBoost.",
+    )
+    parser.set_defaults(use_enhanced_context_static_features=False)
+    parser.add_argument(
+        "--oof-ensemble-pred-path",
+        type=Path,
+        default=None,
+        help="Optional .npz path to save walk-forward OOF ensemble probabilities for meta-stacking.",
+    )
     parser.add_argument(
         "--log-level",
         type=str,
@@ -950,6 +980,7 @@ def build_walkforward_ensemble_cv(
     oof_train_prob: np.ndarray,
     oof_fold_reports: list[dict[str, Any]],
     args: argparse.Namespace,
+    oof_pred_output_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     if not oof_fold_reports:
         return {
@@ -1022,6 +1053,16 @@ def build_walkforward_ensemble_cv(
             "metrics_at_0_5": evaluate_probs(y_true, y_prob, threshold=0.5),
         }
     )
+    if oof_pred_output_path is not None:
+        oof_pred_output_path = Path(oof_pred_output_path)
+        oof_pred_output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            oof_pred_output_path,
+            oof_pred=fold_pred.astype(np.float32),
+            valid_mask=valid_mask.astype(np.uint8),
+            y_true=y_train.astype(np.float32),
+        )
+        summary["oof_pred_path"] = str(oof_pred_output_path)
     summary["fold_metrics"] = fold_metrics
     return summary
 
@@ -1036,6 +1077,81 @@ def row_float(row: pd.Series, name: str) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def split_with_locked_holdout(
+    df: pd.DataFrame,
+    *,
+    val_fraction: float,
+    test_fraction: float,
+    holdout_manifest_path: Path,
+    refresh_holdout_manifest: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    ordered = df.sort_values(["event_date", "fight_id"]).reset_index(drop=True)
+    holdout_manifest_path = Path(holdout_manifest_path)
+
+    def build_from_manifest(fight_ids: set[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        holdout_mask = ordered["fight_id"].astype(str).isin(fight_ids).to_numpy()
+        if int(holdout_mask.sum()) == 0:
+            raise ValueError("Locked holdout manifest had no matching fight_id values in current dataset.")
+        test_df_local = ordered[holdout_mask].copy()
+        remaining = ordered[~holdout_mask].copy()
+        if remaining.empty:
+            raise ValueError("Locked holdout consumed all fights; no data left for train/val.")
+        val_count = max(1, int(round(len(ordered) * float(val_fraction))))
+        val_count = min(val_count, max(1, len(remaining) - 1))
+        train_df_local = remaining.iloc[:-val_count].copy()
+        val_df_local = remaining.iloc[-val_count:].copy()
+        if train_df_local.empty or val_df_local.empty:
+            raise ValueError("Locked holdout split produced empty train/val partitions.")
+        return train_df_local, val_df_local, test_df_local
+
+    used_existing = False
+    manifest_ids: list[str] = []
+    if holdout_manifest_path.exists() and not refresh_holdout_manifest:
+        try:
+            text = holdout_manifest_path.read_text(encoding="utf-8")
+            manifest_ids = [line.strip() for line in text.splitlines() if line.strip()]
+            if manifest_ids:
+                train_df, val_df, test_df = build_from_manifest(set(manifest_ids))
+                used_existing = True
+            else:
+                logging.warning(
+                    "Holdout manifest exists but is empty: %s. Regenerating holdout from chronology.",
+                    holdout_manifest_path,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning(
+                "Failed to load holdout manifest %s (%s). Regenerating holdout from chronology.",
+                holdout_manifest_path,
+                exc,
+            )
+
+    if not used_existing:
+        train_df, val_df, test_df = chronological_split(ordered, val_fraction, test_fraction)
+        holdout_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_ids = test_df["fight_id"].astype(str).tolist()
+        holdout_manifest_path.write_text("\n".join(manifest_ids) + "\n", encoding="utf-8")
+        logging.info(
+            "Locked final holdout manifest %s with %d fights.",
+            holdout_manifest_path,
+            len(manifest_ids),
+        )
+    else:
+        logging.info(
+            "Using locked final holdout from %s (%d fights).",
+            holdout_manifest_path,
+            len(manifest_ids),
+        )
+
+    info = {
+        "manifest_path": str(holdout_manifest_path),
+        "used_existing_manifest": bool(used_existing),
+        "refresh_requested": bool(refresh_holdout_manifest),
+        "holdout_fights": int(len(test_df)),
+        "holdout_fight_ids_preview": manifest_ids[:10],
+    }
+    return train_df, val_df, test_df, info
 
 
 def normalize_weight_class(value: Any) -> str:
@@ -1279,6 +1395,125 @@ def make_static_features(
     ]
 
 
+def rust_bucket_features(days_since_last_fight: float) -> list[float]:
+    days = max(float(days_since_last_fight), 0.0)
+    if days <= 120.0:
+        return [1.0, 0.0, 0.0, 0.0]
+    if days <= 365.0:
+        return [0.0, 1.0, 0.0, 0.0]
+    if days <= 730.0:
+        return [0.0, 0.0, 1.0, 0.0]
+    return [0.0, 0.0, 0.0, 1.0]
+
+
+def safe_div_scalar(num: float, den: float, eps: float = 1e-6) -> float:
+    return float(num) / float(max(float(den), eps))
+
+
+def compute_quality_context(history: np.ndarray, length: int, *, ema_alpha: float = 0.70) -> list[float]:
+    if length <= 0 or history.size == 0:
+        return [0.0] * 8
+    valid = history[-length:].astype(np.float64)
+    opp_elo = np.maximum(history_col(valid, 13), 0.0)
+    if opp_elo.size == 0:
+        return [0.0] * 8
+    recent = opp_elo[-min(3, int(opp_elo.size)) :]
+    mean_all = float(np.mean(opp_elo))
+    recent_mean = float(np.mean(recent))
+    return [
+        mean_all,
+        float(np.std(opp_elo)),
+        recent_mean,
+        float(recent_mean - mean_all),
+        slope_1d(opp_elo),
+        ema_1d(opp_elo, ema_alpha),
+        float(np.max(opp_elo)),
+        float(np.min(opp_elo)),
+    ]
+
+
+def make_enhanced_context_features(
+    *,
+    elo_a: float,
+    elo_b: float,
+    days_a: float,
+    days_b: float,
+    age_a_days: float,
+    age_b_days: float,
+    height_a_cm: float,
+    height_b_cm: float,
+    reach_a_cm: float,
+    reach_b_cm: float,
+    career_abs_a: float,
+    career_abs_b: float,
+    quality_a: list[float],
+    quality_b: list[float],
+) -> list[float]:
+    days_a = max(days_a, 0.0)
+    days_b = max(days_b, 0.0)
+    age_a_years = max(age_a_days, 0.0) / 365.25 if age_a_days > 0 else 0.0
+    age_b_years = max(age_b_days, 0.0) / 365.25 if age_b_days > 0 else 0.0
+    age_gap = age_a_years - age_b_years
+    abs_age_gap = abs(age_gap)
+    younger_a = 1.0 if age_gap < 0 else 0.0
+
+    rust_a = rust_bucket_features(days_a)
+    rust_b = rust_bucket_features(days_b)
+    rust_gap_years = (days_a - days_b) / 365.25
+    rust_ratio = safe_div_scalar(np.log1p(days_a), np.log1p(days_b))
+
+    reach_height_a = safe_div_scalar(max(reach_a_cm, 0.0), max(height_a_cm, 1e-6))
+    reach_height_b = safe_div_scalar(max(reach_b_cm, 0.0), max(height_b_cm, 1e-6))
+    reach_diff = max(reach_a_cm, 0.0) - max(reach_b_cm, 0.0)
+    height_diff = max(height_a_cm, 0.0) - max(height_b_cm, 0.0)
+
+    dmg_a = max(career_abs_a, 0.0)
+    dmg_b = max(career_abs_b, 0.0)
+    dmg_per_year_a = safe_div_scalar(dmg_a, max(age_a_years, 18.0))
+    dmg_per_year_b = safe_div_scalar(dmg_b, max(age_b_years, 18.0))
+
+    elo_diff = elo_a - elo_b
+    elo_rust_adj = safe_div_scalar(elo_diff, 1.0 + abs(rust_gap_years))
+    elo_age_adj = safe_div_scalar(elo_diff, 1.0 + abs_age_gap)
+
+    qa_mean, qa_std, qa_recent, qa_recent_delta, qa_slope, qa_ema, qa_max, qa_min = quality_a
+    qb_mean, qb_std, qb_recent, qb_recent_delta, qb_slope, qb_ema, qb_max, qb_min = quality_b
+
+    return [
+        *rust_a,
+        *rust_b,
+        rust_gap_years,
+        rust_ratio,
+        age_gap,
+        abs_age_gap,
+        age_gap * age_gap,
+        younger_a * abs_age_gap,
+        max(age_a_years, age_b_years),
+        reach_height_a,
+        reach_height_b,
+        reach_height_a - reach_height_b,
+        reach_diff * younger_a,
+        height_diff * younger_a,
+        dmg_per_year_a,
+        dmg_per_year_b,
+        dmg_per_year_a - dmg_per_year_b,
+        elo_rust_adj,
+        elo_age_adj,
+        qa_mean,
+        qb_mean,
+        qa_mean - qb_mean,
+        qa_recent,
+        qb_recent,
+        qa_recent - qb_recent,
+        qa_recent_delta - qb_recent_delta,
+        qa_slope - qb_slope,
+        qa_ema - qb_ema,
+        qa_std - qb_std,
+        qa_max - qb_max,
+        qa_min - qb_min,
+    ]
+
+
 def build_oriented_static_matrix(
     df: pd.DataFrame,
     *,
@@ -1286,6 +1521,7 @@ def build_oriented_static_matrix(
     f2_raw: np.ndarray,
     trend_ema_alpha: float,
     use_trend_static_features: bool,
+    use_enhanced_context_static_features: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     rows: list[list[float]] = []
     labels: list[int] = []
@@ -1316,6 +1552,8 @@ def build_oriented_static_matrix(
         len_f2 = int(max(row_float(row_s, "f2_history_len"), 0.0))
         len_f1 = min(len_f1, int(f1_raw.shape[1]))
         len_f2 = min(len_f2, int(f2_raw.shape[1]))
+        quality_f1 = compute_quality_context(f1_raw[i], len_f1)
+        quality_f2 = compute_quality_context(f2_raw[i], len_f2)
 
         base_ab = make_static_features(
             elo_a=elo_f1,
@@ -1342,6 +1580,25 @@ def build_oriented_static_matrix(
                     f2_raw[i],
                     len_f2,
                     ema_alpha=trend_ema_alpha,
+                )
+            )
+        if use_enhanced_context_static_features:
+            base_ab.extend(
+                make_enhanced_context_features(
+                    elo_a=elo_f1,
+                    elo_b=elo_f2,
+                    days_a=days_f1,
+                    days_b=days_f2,
+                    age_a_days=age_days_f1,
+                    age_b_days=age_days_f2,
+                    height_a_cm=height_f1,
+                    height_b_cm=height_f2,
+                    reach_a_cm=reach_f1,
+                    reach_b_cm=reach_f2,
+                    career_abs_a=career_abs_f1,
+                    career_abs_b=career_abs_f2,
+                    quality_a=quality_f1,
+                    quality_b=quality_f2,
                 )
             )
         rows.append(base_ab)
@@ -1372,6 +1629,25 @@ def build_oriented_static_matrix(
                     f1_raw[i],
                     len_f1,
                     ema_alpha=trend_ema_alpha,
+                )
+            )
+        if use_enhanced_context_static_features:
+            base_ba.extend(
+                make_enhanced_context_features(
+                    elo_a=elo_f2,
+                    elo_b=elo_f1,
+                    days_a=days_f2,
+                    days_b=days_f1,
+                    age_a_days=age_days_f2,
+                    age_b_days=age_days_f1,
+                    height_a_cm=height_f2,
+                    height_b_cm=height_f1,
+                    reach_a_cm=reach_f2,
+                    reach_b_cm=reach_f1,
+                    career_abs_a=career_abs_f2,
+                    career_abs_b=career_abs_f1,
+                    quality_a=quality_f2,
+                    quality_b=quality_f1,
                 )
             )
         rows.append(base_ba)
@@ -1565,7 +1841,13 @@ def main() -> int:
         drop_empty_history=args.drop_empty_history,
     )
     df = attach_weight_class(df, args.input_csv)
-    train_df, val_df, test_df = chronological_split(df, args.val_fraction, args.test_fraction)
+    train_df, val_df, test_df, holdout_info = split_with_locked_holdout(
+        df,
+        val_fraction=args.val_fraction,
+        test_fraction=args.test_fraction,
+        holdout_manifest_path=args.holdout_manifest_path,
+        refresh_holdout_manifest=bool(args.refresh_holdout_manifest),
+    )
     logging.info(
         "Fight splits -> train: %d | val: %d | test: %d",
         len(train_df),
@@ -1687,6 +1969,7 @@ def main() -> int:
         f2_raw=train_f2,
         trend_ema_alpha=float(args.trend_ema_alpha),
         use_trend_static_features=bool(args.use_trend_static_features),
+        use_enhanced_context_static_features=bool(args.use_enhanced_context_static_features),
     )
     x_val_static, y_val = build_oriented_static_matrix(
         val_df,
@@ -1694,6 +1977,7 @@ def main() -> int:
         f2_raw=val_f2,
         trend_ema_alpha=float(args.trend_ema_alpha),
         use_trend_static_features=bool(args.use_trend_static_features),
+        use_enhanced_context_static_features=bool(args.use_enhanced_context_static_features),
     )
     x_test_static, y_test = build_oriented_static_matrix(
         test_df,
@@ -1701,6 +1985,7 @@ def main() -> int:
         f2_raw=test_f2,
         trend_ema_alpha=float(args.trend_ema_alpha),
         use_trend_static_features=bool(args.use_trend_static_features),
+        use_enhanced_context_static_features=bool(args.use_enhanced_context_static_features),
     )
     weight_train_full = build_oriented_weight_classes(train_df)
     weight_val = build_oriented_weight_classes(val_df)
@@ -1765,6 +2050,7 @@ def main() -> int:
             oof_train_prob=momentum_train_oof_prob,
             oof_fold_reports=oof_fold_reports,
             args=args,
+            oof_pred_output_path=args.oof_ensemble_pred_path,
         )
 
     val_prob_global = xgb_model.predict_proba(x_val)[:, 1].astype(np.float32)
@@ -1833,6 +2119,7 @@ def main() -> int:
         "specialist_blend_alpha": float(args.specialist_blend_alpha),
         "trend_ema_alpha": float(args.trend_ema_alpha),
         "use_trend_static_features": bool(args.use_trend_static_features),
+        "use_enhanced_context_static_features": bool(args.use_enhanced_context_static_features),
     }
     metrics_report = {
         "input_csv": str(args.input_csv),
@@ -1844,6 +2131,7 @@ def main() -> int:
             "val_samples": int(len(val_data)),
             "test_samples": int(len(test_data)),
         },
+        "holdout": holdout_info,
         "oof_stacking": {
             "enabled": bool(args.use_oof_stacking),
             "samples_used_for_xgb_train": int(stack_mask.sum()),
